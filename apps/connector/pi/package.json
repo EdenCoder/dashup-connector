@@ -1,0 +1,12 @@
+{
+  "name": "@dashup/pi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Connect an existing interactive Pi session to your paired Dashup devices.",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

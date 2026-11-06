@@ -1,0 +1,56 @@
+{
+  "name": "@dashup/connector",
+  "version": "0.1.39",
+  "license": "MIT",
+  "homepage": "https://dashup.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EdenCoder/dashup-connector.git",
+    "directory": "apps/connector"
+  },
+  "bugs": "https://github.com/EdenCoder/dashup-connector/issues",
+  "type": "module",
+  "bin": {
+    "dashup": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "claude",
+    "pi"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "dashup": "tsx src/index.ts",
+    "dev": "tsx src/index.ts watch",
+    "start": "node dist/index.js watch",
+    "build": "tsup",
+    "check-types": "tsc --noEmit",
+    "test": "node --import tsx --test tests/connector.test.ts tests/chat.test.ts tests/harness-history.test.ts tests/harness-live.test.ts tests/opencode-service.test.ts tests/harness-processes.test.ts tests/harness-queue.test.ts tests/harness-vscode.test.ts tests/cline.test.ts tests/pi.test.ts tests/kilo.test.ts tests/junie.test.ts tests/install.test.ts tests/headless.test.ts tests/stop.test.ts tests/attention.test.ts tests/uploads.test.ts tests/terminal.test.ts tests/pipe.test.ts tests/phone.test.ts tests/workbenches.test.ts tests/resets.test.ts"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.9.0",
+    "@clack/prompts": "^1.8.1",
+    "@microsoft/agent-host-protocol": "1.0.0",
+    "@xterm/addon-serialize": "^0.14.0",
+    "@xterm/headless": "^6.0.0",
+    "node-pty": "^1.1.0",
+    "qrcode": "^1.5.4",
+    "ws": "^8.21.3",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@dashup/protocol": "workspace:*",
+    "@parcae/sdk": "workspace:*",
+    "@types/node": "^25.9.1",
+    "@types/qrcode": "^1.5.6",
+    "@types/ws": "^8.18.2",
+    "tsup": "^8.5.1",
+    "tsx": "^4.22.4",
+    "typescript": "^5.9.3"
+  }
+}

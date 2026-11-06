@@ -1,0 +1,165 @@
+/**
+ * @parcae/sdk — createClient()
+ *
+ * Sessions live in the transport. The auth adapter is the source of
+ * truth for tokens; the transport handles handshake + reconnect via
+ * the hello/resync protocol. See `transports/socket.ts` for the
+ * wire contract.
+ */
+
+import { Model, FrontendAdapter } from "@parcae/model";
+import type { Transport, RequestOptions } from "@parcae/model";
+import { SocketTransport } from "./transports/socket";
+import type {
+  ResyncEntry,
+  ResyncResult,
+  TransportDiagnostics,
+  SessionRefreshOptions,
+} from "./transports/socket";
+import type { SessionMachine } from "./session-machine";
+import type { ConnectionMachine } from "./connection-machine";
+
+export interface ClientConfig {
+  url: string;
+  version?: string;
+  /**
+   * Token resolver — called once before the initial hello and once
+   * per reconnect. Return `null` for anonymous sessions.
+   */
+  getToken: () => Promise<string | null>;
+  /**
+   * socket.io transports list. Defaults to `["websocket"]`. Pass
+   * `["polling"]` on runtimes without a WebSocket global (e.g. Lynx
+   * PrimJS in a custom native shell).
+   */
+  transports?: ("websocket" | "polling")[];
+  /**
+   * Extra headers attached to the socket handshake. Applied in Node
+   * and React Native; browsers ignore them for WebSocket transport.
+   * Pass a stable reference when this config is created during render.
+   */
+  extraHeaders?: Record<string, string>;
+  /**
+   * Dial the socket at construction (default `true`). Pass `false`
+   * for a connection-less client — e.g. one created at module scope
+   * for SSR, where the session must stay `pending` and no socket may
+   * leave the render server. `reconnect()` dials on demand.
+   */
+  autoConnect?: boolean;
+  /**
+   * Watchdog stale threshold in ms; `0` disables the transport
+   * watchdog. Default 8000. See SocketTransportConfig.
+   */
+  watchdogStaleMs?: number;
+}
+
+export interface ParcaeClient {
+  transport: Transport;
+  adapter: FrontendAdapter;
+  session: SessionMachine;
+  connection: ConnectionMachine;
+  get(path: string, data?: any, options?: RequestOptions): Promise<any>;
+  post(path: string, data?: any, options?: RequestOptions): Promise<any>;
+  put(path: string, data?: any, options?: RequestOptions): Promise<any>;
+  patch(path: string, data?: any, options?: RequestOptions): Promise<any>;
+  delete(path: string, data?: any, options?: RequestOptions): Promise<any>;
+  subscribe(event: string, handler: (...args: any[]) => void): () => void;
+  unsubscribe(event: string, handler?: (...args: any[]) => void): void;
+  send(event: string, ...args: any[]): void;
+  readonly isConnected: boolean;
+  /** Re-run the hello handshake on the current socket. */
+  refreshSession(options?: SessionRefreshOptions): Promise<{ userId: string | null }>;
+  /** @internal The token the server last validated at hello, if any. */
+  _lastConfirmedToken?(): string | null;
+  /** Explicit sign-out — terminates the session machine. */
+  terminateSession(): Promise<void>;
+  /** Server resync RPC — batched query subscription restore. */
+  resync(entries: ResyncEntry[]): Promise<ResyncResult[]>;
+  /** Run query reads and attach their listeners before releasing unused server subscriptions. */
+  withQuerySubscriptions<T>(operation: () => Promise<T>): Promise<T>;
+  /** Watchdog foreground gate — the consumer's app-active signal. */
+  setActive?(active: boolean): void;
+  /** Watchdog "conditions changed, try now" signal. */
+  kick?(): void;
+  /** Technical transport snapshot for diagnostics/telemetry. */
+  diagnostics?(): TransportDiagnostics;
+  /** @internal Publish a diagnostic event on the transport emitter. */
+  _emitDiagnostic?(event: string, payload: Record<string, unknown>): void;
+  on(event: string, handler: (...args: any[]) => void): void;
+  off(event: string, handler?: (...args: any[]) => void): void;
+  disconnect(): void;
+  reconnect(): Promise<void>;
+  /** Bind a Model constructor to this client without changing global state. */
+  bind<T extends typeof Model>(model: T): T;
+  /** Permanently release this client's socket and listeners. */
+  dispose(): void;
+}
+
+export function createClient(config: ClientConfig): ParcaeClient {
+  const transport = new SocketTransport({
+    url: config.url,
+    version: config.version ?? "v1",
+    getToken: config.getToken,
+    transports: config.transports,
+    extraHeaders: config.extraHeaders,
+    autoConnect: config.autoConnect,
+    watchdogStaleMs: config.watchdogStaleMs,
+  });
+
+  const adapter = new FrontendAdapter(transport);
+
+  const client: ParcaeClient = {
+    transport,
+    adapter,
+    session: transport.session,
+    connection: transport.connection,
+    get: (p, d, o) => transport.get(p, d, o),
+    post: (p, d, o) => transport.post(p, d, o),
+    put: (p, d, o) => transport.put(p, d, o),
+    patch: (p, d, o) => transport.patch(p, d, o),
+    delete: (p, d, o) => transport.delete(p, d, o),
+    subscribe: (e, h) => transport.subscribe(e, h),
+    unsubscribe: (e, h) => transport.unsubscribe(e, h),
+    send: (e, ...a) => transport.send(e, ...a),
+    get isConnected() {
+      return transport.isConnected;
+    },
+    refreshSession: (options) => transport.refreshSession(options),
+    _lastConfirmedToken: () => transport.lastConfirmedToken(),
+    terminateSession: () => transport.terminateSession(),
+    resync: (entries) => transport.resync(entries),
+    withQuerySubscriptions: (operation) => transport.withQuerySubscriptions(operation),
+    setActive: (active) => transport.setActive(active),
+    kick: () => transport.kick(),
+    diagnostics: () => transport.diagnostics(),
+    _emitDiagnostic: (event, payload) => void transport.emit(event, payload),
+    on: (e, h) => transport.on(e, h),
+    off: (e, h) => transport.off(e, h),
+    disconnect: () => transport.disconnect(),
+    reconnect: () => transport.reconnect(),
+    bind: (model) => model.bind(adapter),
+    dispose: () => transport.dispose(),
+  };
+
+  return client;
+}
+
+/**
+ * Run one isolated operation on its own physical socket and always
+ * release that socket afterward. For one-shot background work — a push
+ * action, a headless task — that must never share the Provider-owned
+ * client or leave a session-bearing socket open when it finishes.
+ * Query models through `client.bind(Model)`; the global Model binding
+ * is never touched.
+ */
+export async function withIsolatedClient<T>(
+  config: ClientConfig,
+  operation: (client: ParcaeClient) => Promise<T>,
+): Promise<T> {
+  const client = createClient(config);
+  try {
+    return await operation(client);
+  } finally {
+    client.dispose();
+  }
+}

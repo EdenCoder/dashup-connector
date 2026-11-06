@@ -1,0 +1,291 @@
+# @parcae/model
+
+The core Model system for Parcae. Class properties are the schema. Direct property access with EventEmitter-based change tracking, explicit reference expansion, and a pluggable adapter pattern that runs the same code on frontend and backend.
+
+## Install
+
+```bash
+npm install @parcae/model
+```
+
+## Define a Model
+
+```typescript
+import { Model, type Ref } from "@parcae/model";
+
+class Post extends Model {
+  static type = "post" as const;
+
+  user!: Ref<User>; // raw ID or explicitly expanded User -> VARCHAR storing ID
+  title: string = ""; // string -> VARCHAR
+  body: PostBody = {}; // object -> JSONB
+  tags: string[] = []; // array -> JSONB
+  published: boolean = false; // boolean -> BOOLEAN
+  views: number = 0; // number -> DOUBLE PRECISION
+}
+```
+
+No decorators, no separate schema definition, no Zod. The class properties _are_ the schema.
+
+## Property Access
+
+The Model instance IS the data store — no Proxy wrapper, no write interception. Direct property reads/writes hit an internal `__data` object. Reactivity flows through `EventEmitter` (`model.on("change", ...)`); the React SDK subscribes via `useSyncExternalStore`.
+
+```typescript
+const post = await Post.findById("abc");
+
+post.title; // "Hello" — direct read from __data
+post.title = "Updated"; // change tracked automatically, emits "change"
+post.published; // false — typed as boolean
+
+await post.save(); // flushes tracked changes
+```
+
+## References
+
+Declare references with `Ref<T>`. They stay raw ids until explicitly expanded;
+expanded values are plain projections (not guaranteed Model instances), and the
+`$` prefix always gives direct raw-id access.
+
+```typescript
+post.user; // "user_k8f2m9x" — unexpanded Ref<User>
+post.$user; // "user_k8f2m9x" — raw string ID, no loading
+
+const [expanded] = await Post.where({ id: post.id }).expand("user").find();
+if (typeof expanded.user !== "string") {
+  expanded.user.name; // synchronous — User was inlined by the query
+}
+
+// Setting a reference accepts a Model instance or raw ID.
+post.user = someUser;
+post.$user = "user_abc123"; // sets raw ID directly
+```
+
+## Static Query Methods
+
+Static query methods use the adapter bound to that model constructor. `Model.use()` installs a default exactly once; `Model.bind(adapter)` returns an independent adapter-bound constructor without mutating the source class.
+
+```typescript
+// Find by ID
+const post = await Post.findById("abc");
+
+// Query builder
+const published = await Post.where({ published: true })
+  .orderBy("createdAt", "desc")
+  .limit(10)
+  .find();
+
+// Other entry points
+Post.whereIn("id", ["a", "b", "c"]);
+Post.whereNot({ published: false });
+Post.whereNotIn("status", ["draft", "archived"]);
+Post.whereRaw("views > ?", 100);
+Post.select("title", "views");
+Post.count();
+
+// Convenience: paginated, sorted
+Post.basic(25, "createdAt", "desc", 0);
+```
+
+## Instance Methods
+
+```typescript
+// Create
+const post = Post.create({ title: "New Post" });
+post.id; // auto-generated 20-char ID
+
+// Save (insert or update)
+await post.save();
+
+// Concurrent saves auto-coalesce — N rapid save/flush calls produce at
+// most two round-trips per burst (leading edge + trailing edge), so
+// streaming call sites can fire `post.flush()` per delta without
+// hand-rolling debounce.
+post.title = "A";
+post.title = "AB"; // folded into the in-flight save
+await post.save();
+
+// Atomic JSON Patch (RFC 6902)
+await post.patch([
+  { op: "replace", path: "/title", value: "Patched" },
+  { op: "add", path: "/body/blocks/-", value: { type: "text" } },
+]);
+
+// Delete
+await post.remove();
+
+// Reload from adapter (skips in-flight changes)
+await post.refresh();
+
+// Serialize
+post.toJSON(); // { type, id, title, ... }
+await post.sanitize(user); // override in subclass to strip fields
+```
+
+## Query Chain
+
+The `QueryChain<T>` interface supports 40+ chainable methods:
+
+**Filtering:** `where`, `andWhere`, `orWhere`, `whereIn`, `whereNot`, `whereNotIn`, `whereNull`, `whereNotNull`, `whereBetween`, `whereRaw`, `orWhereRaw`, `orWhereIn`, `orWhereNull`, `whereExists`
+
+**Ordering & Pagination:** `orderBy`, `orderByRaw`, `limit`, `offset`
+
+**Selection & Grouping:** `select`, `distinct`, `distinctOn`, `groupBy`, `groupByRaw`, `having`, `havingRaw`
+
+**Joins:** `join`, `innerJoin`, `leftJoin`, `rightJoin`
+
+**Aggregates:** `sum`, `avg`, `min`, `max`, `increment`, `decrement`
+
+**Terminal:** `find()`, `first()`, `count()`
+
+On the backend, each method directly mutates a Knex query. On the frontend, each method records a serializable `QueryStep` sent to the server for execution.
+
+## Adapter Pattern
+
+The `ModelAdapter` interface decouples the Model from persistence:
+
+```typescript
+interface ModelAdapter {
+  save(model, data): Promise<Record<string, any> | void>;
+  remove(model): Promise<void>;
+  findById(modelClass, id): Promise<T | null>;
+  query(modelClass): QueryChain<T>;
+  patch(model, ops, data): Promise<Record<string, any> | void>;
+}
+```
+
+Write adapters return the authoritative row for `Model` to merge. A backend
+adapter may return `void` only when it has already applied authoritative hook
+and persistence mutations to the model instance itself.
+
+| Adapter           | Store                   | Persistence                     |
+| ----------------- | ----------------------- | ------------------------------- |
+| `FrontendAdapter` | Plain object (EventEmitter) | Transport RPC (Socket.IO)       |
+| `BackendAdapter`  | Plain object            | Knex + PostgreSQL               |
+
+Set the application default once at startup:
+
+```typescript
+import { Model } from "@parcae/model";
+
+Model.use(adapter);
+```
+
+For multiple application or client contexts, bind instead of replacing the default:
+
+```typescript
+const PublicPost = Post.bind(publicAdapter);
+const AdminPost = Post.bind(adminAdapter);
+
+await PublicPost.where({ published: true }).find();
+await AdminPost.where({}).find();
+```
+
+## FrontendAdapter
+
+Included in this package. Wraps a `Transport` to handle client-side persistence.
+
+```typescript
+import { FrontendAdapter } from "@parcae/model";
+
+const adapter = new FrontendAdapter(transport);
+const ClientPost = Post.bind(adapter);
+```
+
+`@parcae/sdk` exposes the same operation as `client.bind(Post)`, which is the preferred client API because it keeps the transport and adapter lifecycle together.
+
+The `Transport` interface is protocol-agnostic:
+
+```typescript
+interface Transport {
+  get(path, data?): Promise<any>;
+  post(path, data?): Promise<any>;
+  put(path, data?): Promise<any>;
+  patch(path, data?): Promise<any>;
+  delete(path, data?): Promise<any>;
+  subscribe?(event, handler): () => void;
+  unsubscribe?(event, handler?): void;
+  send?(event, ...args): void;
+  readonly isConnected?: boolean;
+  readonly isLoading?: boolean;
+  on?(event, handler): void;
+  off?(event, handler?): void;
+  disconnect?(): void;
+  reconnect?(): Promise<void>;
+}
+```
+
+## Static Properties
+
+| Property           | Type                 | Description                                                                       |
+| ------------------ | -------------------- | --------------------------------------------------------------------------------- |
+| `type`             | `string`             | Model identifier. Used for table naming and routing.                              |
+| `path`             | `string?`            | Custom API path. Defaults to `/v1/{type}s`.                                       |
+| `scope`            | `ModelScope?`        | Row-level security rules.                                                          |
+| `indexes`          | `IndexDefinition[]?` | Database index definitions.                                                        |
+| `searchFields`     | `string[]?`          | Fields to index for full-text + fuzzy search (weighted by order).                 |
+| `readonlyFields`   | `readonly string[]?` | Columns stripped from client request bodies before apply (server can still write).|
+| `updateReadonlyFields` | `readonly string[]?` | Additional columns protected on PUT/PATCH but accepted on POST.                |
+| `privateFields`    | `readonly string[]?` | Columns stripped from the default `sanitize()` projection (don't leak via GET).   |
+| `managed`          | `boolean`            | `false` for externally managed tables (e.g. auth). Default: `true`.               |
+| `__schema`         | `SchemaDefinition?`  | Resolved at startup by ts-morph. Maps properties to column types.                 |
+
+## Type Mapping
+
+| TypeScript       | ColumnType        | Postgres              |
+| ---------------- | ----------------- | --------------------- |
+| `string`         | `"string"`        | VARCHAR(2048)         |
+| `string` (long)  | `"text"`          | TEXT                  |
+| `number` (int)   | `"integer"`       | INTEGER               |
+| `number` (float) | `"number"`        | DOUBLE PRECISION      |
+| `boolean`        | `"boolean"`       | BOOLEAN               |
+| `Date`           | `"datetime"`      | TIMESTAMP             |
+| `SomeModel`      | `{ kind: "ref" }` | VARCHAR (foreign key) |
+| object / array   | `"json"`          | JSONB                 |
+
+## Exports
+
+```typescript
+import {
+  Model,
+  generateId,
+  dateSafeClone,
+  flushChangeEmits,
+  FrontendAdapter,
+  ops,
+  dedupOps,
+  CHAINABLE_METHODS,
+  extractExpandFields,
+  orderEmissionDisabled,
+  stripExpandSteps,
+  SYM_SERVER_MERGE,
+  SYM_VERSION,
+} from "@parcae/model";
+import type {
+  Transport,
+  RequestOptions,
+  ModelAdapter,
+  ModelClass,
+  ModelConstructor,
+  QueryChain,
+  QueryStep,
+  SchemaDefinition,
+  ColumnType,
+  ScopeContext,
+  PatchOp,
+  WithRefs,
+  OpBuilder,
+  Text,
+} from "@parcae/model";
+```
+
+Deep imports also available:
+
+```typescript
+import { FrontendAdapter } from "@parcae/model/adapters/client";
+import type { ModelAdapter } from "@parcae/model/adapters/types";
+```
+
+## License
+
+MIT

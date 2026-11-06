@@ -1,0 +1,51 @@
+{
+  "name": "@parcae/model",
+  "version": "0.8.0",
+  "description": "Parcae Model — typed ORM base class with adapter pattern",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./adapters/types": {
+      "types": "./dist/adapters/types.d.ts",
+      "import": "./dist/adapters/types.js",
+      "default": "./dist/adapters/types.js"
+    },
+    "./adapters/client": {
+      "types": "./dist/adapters/client.d.ts",
+      "import": "./dist/adapters/client.js",
+      "default": "./dist/adapters/client.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "eventemitter3": "^5.0.4",
+    "fast-json-patch": "^3.1.1",
+    "pluralize": "^8.0.0",
+    "short-unique-id": "^5.3.2"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "@types/pluralize": "^0.0.33",
+    "tsup": "^8.5.1",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  },
+  "license": "MIT"
+}

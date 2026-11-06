@@ -1,0 +1,253 @@
+"use client";
+
+import React, { useEffect, useRef, useState } from "react";
+import { Model } from "@parcae/model";
+import { createClient } from "../client";
+import type { ParcaeClient, ClientConfig } from "../client";
+import type { AuthClientAdapter } from "../auth-adapter";
+import { ParcaeContext } from "./context";
+import { _onResyncRequired, _purgeCacheForUser } from "./useQuery";
+import {
+  _authorizationClaims,
+  _differingClaimNames,
+  _fingerprintAuthorizationClaims,
+} from "../token-claims";
+import { log } from "../log";
+
+export interface ParcaeProviderProps {
+  /** Pre-created client instance. */
+  client?: ParcaeClient;
+  /** Backend URL. */
+  url?: string;
+  /** Auth adapter — handles session resolution internally. */
+  auth?: AuthClientAdapter;
+  version?: string;
+  /**
+   * Bind this client's adapter as the default for every Model class —
+   * the frontend equivalent of the backend's `Model.use(adapter)` in
+   * createApp(). Static factories (`Project.create(...)`, terminal
+   * query methods on unbound classes) then work anywhere in the tree.
+   * Default `true`.
+   *
+   * The first mounted provider wins; a concurrent provider with a
+   * different client skips silently. Explicit `client.bind(Model)`
+   * and `useQuery` chain rebinding still take precedence for
+   * multi-client apps — pass `false` there to opt out entirely.
+   */
+  bindAdapter?: boolean;
+  /**
+   * socket.io transports list. Defaults to `["websocket"]`. Pass
+   * `["polling"]` on runtimes without a WebSocket global.
+   */
+  transports?: ("websocket" | "polling")[];
+  /**
+   * Extra headers attached to the socket handshake. Applied in Node
+   * and React Native; browsers ignore them for WebSocket transport.
+   * Pass a stable (module-level) reference: a fresh object per
+   * render creates a fresh client.
+   */
+  extraHeaders?: Record<string, string>;
+  /**
+   * Transport watchdog stale threshold in ms; `0` disables it.
+   * Forwarded to the owned client's transport (url form only).
+   */
+  watchdogStaleMs?: number;
+  children: React.ReactNode;
+  onReady?: (client: ParcaeClient) => void;
+  onError?: (error: Error) => void;
+}
+
+const noopToken = async () => null;
+const readyClients = new WeakSet<ParcaeClient>();
+
+interface ClientProviderProps extends ParcaeProviderProps {
+  client: ParcaeClient;
+}
+
+const ClientProvider: React.FC<ClientProviderProps> = ({
+  client,
+  url,
+  auth,
+  bindAdapter = true,
+  children,
+  onReady,
+  onError,
+}) => {
+  const onReadyRef = useRef(onReady);
+  onReadyRef.current = onReady;
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
+
+  // ── Default model adapter ───────────────────────────────────────
+  // One global default per realm: the first provider to mount binds
+  // the base Model class, which every subclass resolves through the
+  // prototype walk in getBoundAdapter(). A second concurrent provider
+  // finds the binding already set and leaves it alone.
+  useEffect(() => {
+    if (!bindAdapter || Model.hasAdapter()) return;
+    Model.use(client.adapter);
+  }, [bindAdapter, client]);
+
+  // ── Session lifecycle ───────────────────────────────────────────
+  useEffect(() => {
+    let lastUserId: string | null = client.session.state.userId;
+    let lastStatus = client.session.state.status;
+
+    // Fire onReady the first time the session leaves "pending".
+    const fireReady = () => {
+      if (readyClients.has(client)) return;
+      if (client.session.state.status === "pending") return;
+      const onClientReady = onReadyRef.current;
+      if (!onClientReady) return;
+      readyClients.add(client);
+      try {
+        onClientReady(client);
+      } catch (err: any) {
+        log.warn("onReady threw:", err?.message);
+      }
+    };
+
+    const unsubSession = client.session.subscribe(() => {
+      const nowUserId = client.session.state.userId;
+      const nowStatus = client.session.state.status;
+      if (
+        lastStatus !== "pending" &&
+        (nowUserId !== lastUserId || nowStatus !== lastStatus)
+      ) {
+        // Passing the next identity lets the cache pool the
+        // anonymous → authenticated handoff (public data only) so
+        // mounted queries keep their items while they refetch,
+        // instead of flashing skeletons. Every other transition
+        // disposes outright — scoped data never crosses identities.
+        _purgeCacheForUser(client, lastUserId, nowUserId);
+      }
+      lastUserId = nowUserId;
+      lastStatus = nowStatus;
+      fireReady();
+    });
+    fireReady();
+
+    return () => {
+      unsubSession();
+    };
+  }, [client]);
+
+  // ── Optional auth adapter ────────────────────────────────────────
+  useEffect(() => {
+    if (!auth) return;
+    auth.init(url || "");
+    return auth.onChange((token) => {
+      if (token !== null) {
+        // A rotation that changes no authorization claim needs no session
+        // work: the socket session authenticated at hello and every future
+        // handshake re-reads the resolver. Refreshing anyway re-runs the
+        // handshake and resyncs every mounted subscription, and short-lived
+        // JWTs rotate continuously, so that lands on a timer.
+        //
+        // The baseline is the token the server actually validated, never an
+        // out-of-band resolver read: a fresher read can carry an
+        // authorization change the server has not confirmed, and comparing
+        // against it would swallow that change's corrective onChange.
+        if (client.session.state.status === "authenticated") {
+          const confirmedToken = client._lastConfirmedToken?.() ?? null;
+          const confirmed =
+            confirmedToken === null
+              ? null
+              : _authorizationClaims(confirmedToken);
+          const next = _authorizationClaims(token);
+          if (confirmed !== null && next !== null) {
+            if (
+              _fingerprintAuthorizationClaims(next) ===
+              _fingerprintAuthorizationClaims(confirmed)
+            ) {
+              log.debug("rotation: authorization unchanged, skipping hello");
+              return;
+            }
+            log.debug(
+              `rotation: claims changed (${_differingClaimNames(
+                confirmed,
+                next,
+              ).join(",")}), reconciling`,
+            );
+          }
+        }
+        client.refreshSession().catch(() => {});
+        return;
+      }
+      // A null token is only a sign-out if there was a signed-in
+      // session to lose. Terminating an anonymous (or still-pending)
+      // one is a dead end — `terminate()` is sticky, `useQuery` stops
+      // building keys, and every mounted query reports "loaded, zero
+      // rows" for the rest of the page's life.
+      if (client.session.state.status !== "authenticated") return;
+      client.terminateSession().catch(() => {});
+    });
+  }, [auth, client, url]);
+
+  // ── Resync on reconnect ─────────────────────────────────────────
+  useEffect(() => {
+    const onResync = () => _onResyncRequired(client);
+    client.on("resync-required", onResync);
+    return () => {
+      client.off("resync-required", onResync);
+    };
+  }, [client]);
+
+  // ── Error forwarding ────────────────────────────────────────────
+  useEffect(() => {
+    const onErr = (err: Error) => onErrorRef.current?.(err);
+    client.on("error", onErr);
+    return () => {
+      client.off("error", onErr);
+    };
+  }, [client]);
+
+  return (
+    <ParcaeContext.Provider value={client}>{children}</ParcaeContext.Provider>
+  );
+};
+
+const OwnedProvider: React.FC<Omit<ParcaeProviderProps, "client">> = ({
+  url,
+  auth,
+  version = "v1",
+  transports,
+  extraHeaders,
+  watchdogStaleMs,
+  ...props
+}) => {
+  const [client, setClient] = useState<ParcaeClient | null>(null);
+
+  useEffect(() => {
+    if (!url) return;
+    const getToken: ClientConfig["getToken"] = auth
+      ? async () => {
+          auth.init(url);
+          return await auth.getToken();
+        }
+      : noopToken;
+    const owned = createClient({
+      url,
+      version,
+      getToken,
+      transports,
+      extraHeaders,
+      watchdogStaleMs,
+    });
+    setClient(owned);
+    return () => owned.dispose();
+  }, [url, version, auth, transports, extraHeaders, watchdogStaleMs]);
+
+  if (!client) return null;
+  return <ClientProvider {...props} url={url} auth={auth} client={client} />;
+};
+
+export const ParcaeProvider: React.FC<ParcaeProviderProps> = (props) => {
+  if (props.client) return <ClientProvider {...props} client={props.client} />;
+  if (!props.url) {
+    throw new Error(
+      "ParcaeProvider requires either a `client` or `url` prop",
+    );
+  }
+  return <OwnedProvider {...props} />;
+};

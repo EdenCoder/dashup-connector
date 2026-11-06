@@ -1,0 +1,382 @@
+/**
+ * FrontendAdapter — Transport for Parcae Model.
+ *
+ * Transport-agnostic. Works with any implementation of the Transport interface:
+ * - SocketTransport (Socket.IO — bidirectional, realtime)
+ * - SSETransport (Server-Sent Events — read-heavy, simpler)
+ * - GRPCTransport (gRPC — service-to-service)
+ * - Or any custom transport
+ */
+
+import pluralize from "pluralize";
+import {
+  CHAINABLE_METHODS,
+  extractExpandFields,
+  type ModelAdapter,
+  type ModelConstructor,
+  type PatchOp,
+  type QueryChain,
+  type QueryStep,
+} from "./types";
+import type { Model, WithRefs } from "../Model";
+
+// ─── Transport Interface ─────────────────────────────────────────────────────
+
+/** Per-request options that callers can pass to any RPC method. */
+export interface RequestOptions {
+  /** Override the default RPC timeout (in milliseconds). */
+  timeout?: number;
+}
+
+/**
+ * Abstract transport layer. Decouples the Model system from the wire protocol.
+ *
+ * Implementations:
+ * - SocketTransport: Socket.IO (bidirectional, realtime subscriptions)
+ * - SSETransport: HTTP + Server-Sent Events (read-heavy, simpler infra)
+ * - GRPCTransport: gRPC (service-to-service, protobuf)
+ */
+export interface Transport {
+  // ── Request/Response (RPC-style) ────────────────────────────────────
+  get(path: string, data?: any, options?: RequestOptions): Promise<any>;
+  post(path: string, data?: any, options?: RequestOptions): Promise<any>;
+  put(path: string, data?: any, options?: RequestOptions): Promise<any>;
+  patch(path: string, data?: any, options?: RequestOptions): Promise<any>;
+  delete(path: string, data?: any, options?: RequestOptions): Promise<any>;
+
+  // ── Subscriptions (realtime) ────────────────────────────────────────
+  /**
+   * Subscribe to a named event stream.
+   * Returns a dispose function to unsubscribe.
+   *
+   * Socket.IO: socket.on(event, handler)
+   * SSE: new EventSource(url) per channel
+   * gRPC: server streaming RPC
+   */
+  subscribe?(event: string, handler: (...args: any[]) => void): () => void;
+
+  /**
+   * Unsubscribe from a named event stream.
+   * Alternative to calling the dispose function returned by subscribe().
+   */
+  unsubscribe?(event: string, handler?: (...args: any[]) => void): void;
+
+  // ── Control messages ────────────────────────────────────────────────
+  /**
+   * Send a control message to the server (fire-and-forget).
+   *
+   * Socket.IO: socket.emit(event, ...args)
+   * SSE: POST /v1/__control { event, args }
+   * gRPC: unary RPC
+   */
+  send?(event: string, ...args: any[]): void;
+
+  // ── Connection state ────────────────────────────────────────────────
+  /** Whether the transport is currently connected. */
+  readonly isConnected?: boolean;
+  /** Whether the transport is currently loading/connecting. */
+  readonly isLoading?: boolean;
+
+  /**
+   * Listen for connection state changes.
+   * Events: "connected", "disconnected", "reconnecting", "error"
+   */
+  on?(event: string, handler: (...args: any[]) => void): void;
+  off?(event: string, handler?: (...args: any[]) => void): void;
+
+  /** Disconnect the transport. */
+  disconnect?(): void;
+  /** Reconnect the transport. */
+  reconnect?(): Promise<void>;
+}
+
+/** Transport errors may identify a missing resource without hiding other failures. */
+export interface TransportError extends Error {
+  status?: number;
+  code?: string;
+}
+
+export function isNotFoundError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  // boundary: transport implementations attach their protocol status/code.
+  const transportError = error as TransportError;
+  return transportError.status === 404 || transportError.code === "NOT_FOUND";
+}
+
+/**
+ * Strip version prefix from a path if it starts with /v{number}.
+ * The transport prepends the version automatically.
+ */
+function stripVersion(path: string): string {
+  return path.replace(/^\/v\d+/, "");
+}
+
+// ─── FrontendAdapter ─────────────────────────────────────────────────────────
+
+export class FrontendAdapter implements ModelAdapter {
+  public transport: Transport;
+
+  constructor(transport: Transport) {
+    this.transport = transport;
+  }
+
+  private p(modelPath: string): string {
+    return stripVersion(modelPath);
+  }
+
+  // ── save ─────────────────────────────────────────────────────────────
+
+  /**
+   * Upsert the entire current state of the model.
+   *
+   *  - `__isNew` → POST {full body}.
+   *  - otherwise → PUT {full body}. Targeted field updates use `patch`
+   *    / `flush` instead; `save` is intentionally "replace the whole
+   *    document".
+   *
+   * Both routes return the authoritative row at the transport result root.
+   * Model owns the single authoritative merge.
+   */
+  async save(
+    model: any,
+    data: Record<string, any>,
+  ): Promise<Record<string, any>> {
+    const ModelClass = model.constructor as ModelConstructor;
+    const path = this.resolvePath(ModelClass);
+    const response = model.__isNew
+      ? await this.transport.post(path, data)
+      : await this.transport.put(`${path}/${model.id}`, data);
+
+    if (!response || typeof response !== "object" || Array.isArray(response)) {
+      throw new Error("Model write returned no authoritative row");
+    }
+    return response;
+  }
+
+  // ── remove ───────────────────────────────────────────────────────────
+
+  async remove(model: any): Promise<void> {
+    const ModelClass = model.constructor as ModelConstructor;
+    const path = this.resolvePath(ModelClass);
+    await this.transport.delete(`${path}/${model.id}`);
+  }
+
+  // ── findById ─────────────────────────────────────────────────────────
+
+  async findById<T extends Model>(
+    modelClass: ModelConstructor<T>,
+    id: string,
+  ): Promise<WithRefs<T> | null> {
+    const path = this.resolvePath(modelClass);
+    try {
+      const data = await this.transport.get(`${path}/${id}`);
+      if (!data) return null;
+      return (modelClass as any).hydrate(this, data) as WithRefs<T>;
+    } catch (error) {
+      if (isNotFoundError(error)) return null;
+      throw error;
+    }
+  }
+
+  // ── query ────────────────────────────────────────────────────────────
+
+  query<T extends Model>(modelClass: ModelConstructor<T>): QueryChain<WithRefs<T>> {
+    return this._buildQuery(modelClass, []);
+  }
+
+  private _buildQuery<T extends Model>(
+    modelClass: ModelConstructor<T>,
+    steps: QueryStep[],
+    options: { forceRefresh?: boolean; subscribe?: boolean } = {},
+  ): QueryChain<WithRefs<T>> {
+    const chain: any = {};
+
+    for (const method of CHAINABLE_METHODS) {
+      chain[method] = (...args: any[]) => {
+        return this._buildQuery(
+          modelClass,
+          [
+            ...steps,
+            { method, args: this._serializeArgs(args) },
+          ],
+          options,
+        );
+      };
+    }
+
+    chain.find = async (): Promise<WithRefs<T>[]> => {
+      const path = this.resolvePath(modelClass);
+      const requestData: Record<string, any> = { __query: steps };
+      // `__forceRefresh: true` tells the backend's LIST handler to
+      // re-execute the cached subscription query against the DB and
+      // emit any drift to every subscriber. Used by `useQuery`'s
+      // periodic drift poll to recover from missed events.
+      if (options.forceRefresh) requestData.__forceRefresh = true;
+      // `__subscribe: false` tells the backend's LIST handler to skip
+      // `QuerySubscriptionManager.subscribe` and omit `__queryHash`
+      // from the response. The frontend `useQuery` hook uses this to
+      // honour `{ subscribe: false }` — static queries that never
+      // need realtime push. Default (absent) means subscribed.
+      if (options.subscribe === false) requestData.__subscribe = false;
+      const result = await this.transport.get(path, requestData);
+      // Read the list envelope under the pluralized collection key
+      // (matching the backend route). The `${type}s` key is kept as a
+      // fallback so a newer SDK still reads an older backend that emits
+      // the naive key; `items` is the final generic fallback.
+      const items =
+        result?.[pluralize(modelClass.type)] ??
+        result?.[modelClass.type + "s"] ??
+        result?.items ??
+        [];
+      const models = items.map((row: any) =>
+        (modelClass as any).hydrate(this, row),
+      );
+      // Attach query subscription hash if backend provided one
+      if (result?.__queryHash) {
+        Object.defineProperty(models, "__queryHash", {
+          value: result.__queryHash,
+          enumerable: false,
+        });
+      }
+      // Attach total count for pagination
+      if (typeof result?.totalCount === "number") {
+        Object.defineProperty(models, "__totalCount", {
+          value: result.totalCount,
+          enumerable: false,
+        });
+      }
+      return models;
+    };
+
+    chain.first = async (): Promise<WithRefs<T> | null> => {
+      const all = await chain.find();
+      return all[0] ?? null;
+    };
+
+    chain.count = async (): Promise<number> => {
+      const path = this.resolvePath(modelClass);
+      const result = await this.transport.get(path, {
+        __query: steps,
+        __count: true,
+      });
+      return result?.total ?? 0;
+    };
+
+    chain.sum = async (column: string): Promise<number> => {
+      const path = this.resolvePath(modelClass);
+      const result = await this.transport.get(path, {
+        __query: steps,
+        __sum: column,
+      });
+      const total = Number(result?.total ?? 0);
+      return Number.isFinite(total) ? total : 0;
+    };
+
+    chain.update = async (): Promise<number> => {
+      throw new Error(
+        "bulk update is server-only — there is no auto-CRUD bulk route. " +
+          "Load the models and save them individually, or move the " +
+          "operation behind a server endpoint.",
+      );
+    };
+
+    /**
+     * Returns a sibling chain that, on `.find()`, sets the
+     * `__forceRefresh: true` request flag. The backend's LIST handler
+     * re-executes the cached subscription query against the DB and
+     * emits any drift to every subscriber on the same hash. Used by
+     * `useQuery`'s periodic drift poll — not part of the public
+     * fluent API, kept on the chain so consumers can probe it via
+     * `useQuery`'s `poll` option.
+     */
+    chain.withForceRefresh = (): QueryChain<WithRefs<T>> => {
+      return this._buildQuery(modelClass, steps, {
+        ...options,
+        forceRefresh: true,
+      });
+    };
+
+    /**
+     * Returns a sibling chain that, on `.find()`, sets the
+     * `__subscribe: false` request flag. The backend's LIST handler
+     * skips `QuerySubscriptionManager.subscribe` and omits the
+     * `__queryHash` from the response, so the frontend never attaches
+     * a `query:${hash}` socket listener. Used by `useQuery({
+     * subscribe: false })` and `prefetch(..., { subscribe: false })`
+     * for static queries.
+     */
+    chain.withSubscribe = (subscribe: boolean): QueryChain<WithRefs<T>> => {
+      return this._buildQuery(modelClass, steps, {
+        ...options,
+        subscribe,
+      });
+    };
+
+    chain.__steps = steps;
+    chain.__modelType = modelClass.type;
+    chain.__modelClass = modelClass;
+    chain.__adapter = this;
+    chain.__forceRefresh = options.forceRefresh === true;
+    if (options.subscribe !== undefined) chain.__subscribe = options.subscribe;
+    // `.expand(...)` projections, recovered from the recorded steps.
+    // The frontend doesn't act on them — the backend route handler
+    // re-derives the same list from `__query` — but consumers / tests
+    // benefit from being able to read the projection without walking
+    // the step array.
+    chain.__expand = extractExpandFields(steps);
+
+    return chain as QueryChain<WithRefs<T>>;
+  }
+
+  private _serializeArgs(args: any[]): any[] {
+    return args.map((arg) => {
+      if (typeof arg === "function") {
+        // Capture nested builder calls: .where((b) => b.where(...).orWhere(...))
+        const nestedSteps: QueryStep[] = [];
+        const recorder: any = new Proxy(
+          {},
+          {
+            get: (_target, method: string) => {
+              return (...innerArgs: any[]) => {
+                nestedSteps.push({
+                  method,
+                  args: this._serializeArgs(innerArgs),
+                });
+                return recorder;
+              };
+            },
+          },
+        );
+        arg(recorder);
+        return { __nested: nestedSteps };
+      }
+      return arg;
+    });
+  }
+
+  // ── patch ────────────────────────────────────────────────────────────
+
+  async patch(
+    model: any,
+    ops: PatchOp[],
+    _data: Record<string, any>,
+  ): Promise<Record<string, any>> {
+    const ModelClass = model.constructor as ModelConstructor;
+    const path = this.resolvePath(ModelClass);
+    const response = await this.transport.patch(`${path}/${model.id}`, { ops });
+    if (!response || typeof response !== "object" || Array.isArray(response)) {
+      throw new Error("Model patch returned no authoritative row");
+    }
+    return response;
+  }
+
+  // ── helpers ──────────────────────────────────────────────────────────
+
+  private resolvePath(modelClass: ModelConstructor): string {
+    if (!modelClass.path && !modelClass.type) {
+      throw new Error("Model has no path or type");
+    }
+    const fullPath = modelClass.path ?? `/v1/${pluralize(modelClass.type)}`;
+    return this.p(fullPath);
+  }
+}

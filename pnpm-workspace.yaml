@@ -1,0 +1,5 @@
+packages:
+  - apps/connector
+  - packages/protocol
+  - submodules/parcae/packages/sdk
+  - submodules/parcae/packages/model
