@@ -1,4 +1,5 @@
 import { homedir } from 'node:os';
+import { connect } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { dirname, join, basename } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -9,9 +10,9 @@ import { createServer, type Server, type ServerResponse, type IncomingMessage } 
 
 import type { Approval, AgentOption, ApprovalReply, ThreadSummary } from '@dashup/protocol';
 
-import { configPath } from '../config';
 import { claudeHome } from './history';
-import { MAX_PREVIEW, questionApproval, type Settings, type LiveSession } from './session';
+import { dashupHome } from '../../pi/bridge';
+import { debounced, MAX_PREVIEW, liveDiscovery, questionApproval, type Settings, type LiveSession } from './session';
 
 // =============================================================================
 // Models and switches
@@ -350,10 +351,10 @@ export function decide(
 // other processes post as another session's request, never the person's, so Dashup's plugin for
 // Claude Code (`claude/` in this package) holds a stream open here for its session, and submits
 // each delivery as the person's own. It also holds a request open for each permission request its
-// session waits on, which the phone's answer ends. The plugin connects to the default state
-// directory's socket.
+// session waits on, which the phone's answer ends. Claude Code registers the plugin once for the
+// person, so it connects to the socket in the person's Dashup folder, which the first connector to
+// start holds, whatever state file it runs with.
 const MAX_SESSIONS = 100;
-const MAX_REQUESTS = 1_000;
 const MAX_PROMPT   = 4 * 1024 * 1024;
 const SESSION      = /^\/sessions\/([\w-]{1,100})(\/prompts)?$/;
 
@@ -388,7 +389,7 @@ type Registration = {
 };
 
 async function registrations(): Promise<Registration[]> {
-  if (process.env.DASHUP_LIVE_DISCOVERY === '0') return [];
+  if (!liveDiscovery()) return [];
   const directory = join(claudeHome(), 'sessions');
   const names = await readdir(directory).catch(() => []);
   const found = await Promise.all(
@@ -411,24 +412,34 @@ async function registrations(): Promise<Registration[]> {
   return found.flat();
 }
 
+const answers = (path: string): Promise<boolean> =>
+  new Promise((resolve) => {
+    const socket = connect(path)
+      .once('connect', () => {
+        socket.destroy();
+        resolve(true);
+      })
+      .once('error', () => resolve(false));
+  });
+
 // =============================================================================
 // The registry is watched; each session's plugin holds one stream
 // =============================================================================
 
 export class Claude {
+  readonly harness = 'claude';
   private watcher?: FSWatcher;
-  private notify?: ReturnType<typeof setTimeout>;
+  private readonly soon = debounced(() => this.changed());
   private server?: Server;
   private readonly streams = new Map<string, ServerResponse>();
   private readonly prompts = new Map<string, Prompt>();
-  private readonly requests = new Map<string, Promise<void>>();
 
   constructor(
     private readonly changed: () => void,
-    private readonly socket = join(dirname(configPath()), 'claude.sock'),
+    private readonly socket = join(dashupHome(), 'claude.sock'),
   ) {}
 
-  async refresh(): Promise<LiveSession[]> {
+  async refresh(): Promise<LiveSession<'claude'>[]> {
     this.watch();
     return (await registrations()).map((session) => {
       const plugin    = this.streams.has(session.sessionId);
@@ -442,34 +453,27 @@ export class Claude {
         cwd       : session.cwd,
         updatedAt : new Date(session.updatedAt ?? 0).toISOString(),
         status    : approvals.length ? 'attention' : (STATUS[session.status ?? ''] ?? 'unknown'),
-        messages  : [],
         approvals,
         approve   : approvals.length
-          ? (requestId, approvalId, reply) =>
-              this.once(requestId, async () => {
-                const prompt = this.prompts.get(approvalId);
-                if (prompt?.session !== session.sessionId)
-                  throw new Error('Claude Code approval is no longer pending');
-                prompt.answer(decide(prompt.request, prompt.approval, reply));
-              })
+          ? async (_requestId, approvalId, reply) => {
+              const prompt = this.prompts.get(approvalId);
+              if (prompt?.session !== session.sessionId)
+                throw new Error('Claude Code approval is no longer pending');
+              prompt.answer(decide(prompt.request, prompt.approval, reply));
+            }
           : undefined,
         send      : plugin
-          ? (requestId, text, now) =>
-              this.once(requestId, () =>
-                this.deliver(session.sessionId, now ? { text, now } : { text }))
+          ? (_requestId, text, now) =>
+              this.deliver(session.sessionId, now ? { text, now } : { text })
           : undefined,
-        stop      : plugin
-          ? (requestId) =>
-              this.once(requestId, () => this.deliver(session.sessionId, { now: true }))
-          : undefined,
+        stop      : plugin ? () => this.deliver(session.sessionId, { now: true }) : undefined,
         now       : plugin,
         options   : (recorded) =>
           claudeOptions(models, recorded()).map((option) =>
             option.id === 'auto' ? { ...option, readOnly: true } : option),
         configure : plugin
-          ? (requestId, option, value) =>
-              this.once(requestId, () =>
-                this.deliver(session.sessionId, { text: COMMANDS[option]!(value) }))
+          ? (_requestId, option, value) =>
+              this.deliver(session.sessionId, { text: COMMANDS[option]!(value) })
           : undefined,
       };
     });
@@ -477,7 +481,7 @@ export class Claude {
 
   // Only the connector serves the plugin; one-off commands such as `dashup doctor` read alone.
   async listen(): Promise<void> {
-    if (this.server || process.env.DASHUP_LIVE_DISCOVERY === '0') return;
+    if (this.server || !liveDiscovery()) return;
     const server = (this.server = createServer((request, response) => {
       const [, id, prompt] = SESSION.exec(request.url ?? '') ?? [];
       if (id && prompt && request.method === 'POST') return this.prompt(id, request, response);
@@ -492,8 +496,10 @@ export class Claude {
       response.writeHead(200, { 'Content-Type': 'application/x-ndjson' }).flushHeaders();
       this.changed();
     }));
-    // One connector runs for a state directory, so a socket already here is a stopped one's.
+    // A socket nothing answers is a stopped connector's.
     await mkdir(dirname(this.socket), { recursive: true, mode: 0o700 });
+    if (await answers(this.socket))
+      throw new Error('another Dashup connector on this computer takes them');
     await rm(this.socket, { force: true });
     if (this.server !== server) return;
     await new Promise<void>((resolve, reject) => {
@@ -552,28 +558,10 @@ export class Claude {
         error ? reject(error) : resolve()));
   }
 
-  // Each request delivers at most once.
-  private once(id: string, action: () => Promise<void>): Promise<void> {
-    const known = this.requests.get(id);
-    if (known) return known;
-    if (this.requests.size >= MAX_REQUESTS)
-      this.requests.delete(this.requests.keys().next().value!);
-    const result = action();
-    this.requests.set(id, result);
-    return result;
-  }
-
   private watch(): void {
-    if (this.watcher || process.env.DASHUP_LIVE_DISCOVERY === '0') return;
+    if (this.watcher || !liveDiscovery()) return;
     try {
-      const watcher = (this.watcher = watch(join(claudeHome(), 'sessions'), () => {
-        if (this.notify) return;
-        this.notify = setTimeout(() => {
-          this.notify = undefined;
-          this.changed();
-        }, 100);
-        this.notify.unref();
-      }));
+      const watcher = (this.watcher = watch(join(claudeHome(), 'sessions'), this.soon));
       watcher.on('error', () => {
         watcher.close();
         if (this.watcher === watcher) this.watcher = undefined;
@@ -584,7 +572,7 @@ export class Claude {
   }
 
   stop(): void {
-    clearTimeout(this.notify);
+    this.soon.cancel();
     this.watcher?.close();
     this.watcher = undefined;
     this.prompts.clear();

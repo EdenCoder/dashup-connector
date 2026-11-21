@@ -188,14 +188,13 @@ test(
       assert.equal(native?.harness, 'codex');
       assert.equal(native?.cwd, '/original/project');
       assert.deepEqual(
-        native?.messages.map((message) => message.text),
+        (await native!.readMessages!()).messages.map((message) => message.text),
         ['Existing question', 'Existing answer'],
       );
       assert.equal(native?.status, 'idle');
       assert.ok(native?.send);
       await assert.rejects(native!.stop!('dashup-stop-idle'), /Nothing is running/);
       const initialSend = native!.send!;
-      await native!.send!('dashup-original-reply', 'Continue the existing work');
       await native!.send!('dashup-original-reply', 'Continue the existing work');
       const sends = calls.filter(
         (call) =>
@@ -205,7 +204,6 @@ test(
       assert.equal(sends[0].params.channel, chatUri);
       assert.equal(sends[0].params.action.message.text, 'Continue the existing work');
       assert.equal(sends[0].params.action.turnId, 'dashup-original-reply');
-      await native!.stop!('dashup-stop');
       await native!.stop!('dashup-stop');
       const cancels = calls.filter(
         (call) =>

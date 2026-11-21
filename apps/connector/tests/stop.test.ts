@@ -141,7 +141,6 @@ test('the connector offers stop only while a live session can interrupt it and r
     harness   : 'opencode',
     updatedAt : '2026-10-26T00:00:00.000Z',
     status    : 'working',
-    messages  : [],
     approvals : [],
     stop      : async (requestId) => {
       stopped.push(requestId);
@@ -492,7 +491,6 @@ test('the phone changes what a live session runs with, among the choices it offe
       harness   : 'claude',
       updatedAt : '2026-10-26T00:00:00.000Z',
       status    : 'idle',
-      messages  : [],
       approvals : [],
       options   : () => [
         {

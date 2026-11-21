@@ -152,6 +152,22 @@ export async function link(config: ConnectorConfig, account?: string): Promise<b
     secret,
   );
   const linked             = { ...config, secret };
+  const confirmed = account
+    ? email.toLowerCase() === account.toLowerCase()
+    : await ui.confirm({ message: `Pair this computer with ${email}?`, initialValue: false });
+  if (confirmed !== true) {
+    const cancelled = account
+      ? `Pairing cancelled: that phone uses ${email}, not ${account}.`
+      : 'Pairing cancelled.';
+    // The secret is dropped here, so a pairing the API keeps can never connect.
+    await api(linked, `/dashup/pairings/${pairing.id}`, undefined, 'DELETE').catch((error) => {
+      throw new Error(
+        `${cancelled} Nothing was shared, but the pairing could not be removed from that account: ${error instanceof Error ? error.message : 'the request failed'}`,
+      );
+    });
+    ui.cancel(`${cancelled} Nothing was shared.`);
+    return false;
+  }
   const platform =
     process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'macos' : 'linux';
   const { device } = await api<{ device: DeviceRecord }>(linked, '/dashup/devices', {
@@ -160,18 +176,6 @@ export async function link(config: ConnectorConfig, account?: string): Promise<b
     kind : 'desktop',
     platform,
   });
-  const confirmed = account
-    ? email.toLowerCase() === account.toLowerCase()
-    : await ui.confirm({ message: `Pair this computer with ${email}?`, initialValue: false });
-  if (confirmed !== true) {
-    await api(linked, `/dashup/pairings/${pairing.id}`, undefined, 'DELETE').catch(() => {});
-    ui.cancel(
-      account
-        ? `Pairing cancelled: that phone uses ${email}, not ${account}. Nothing was shared.`
-        : 'Pairing cancelled. Nothing was shared.',
-    );
-    return false;
-  }
   Object.assign(config, {
     secret,
     device,

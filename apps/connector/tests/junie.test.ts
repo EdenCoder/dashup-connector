@@ -121,7 +121,7 @@ test('Junie discovery and availability never start an agent process', async () =
   }
 });
 
-test('Junie uses real session IDs, native permission choices, command deduplication and cancel', async () => {
+test('Junie uses real session IDs, native permission choices and cancel', async () => {
   const native = await fixture();
   try {
     const id = await native.junie.start(native.directory, 'permission');
@@ -141,16 +141,15 @@ test('Junie uses real session IDs, native permission choices, command deduplicat
       session!.approve!('bad-choice', session!.approvals[0]!.id, { choice: 'made-up' }),
       /native Junie permission/,
     );
-    const approved = () =>
-      session!.approve!('same-approval', session!.approvals[0]!.id, { choice: 'native-once' });
-    await Promise.all([approved(), approved()]);
+    await session!.approve!('approval', session!.approvals[0]!.id, { choice: 'native-once' });
     [session] = await until(
       () => native.junie.refresh(),
       (sessions) => sessions[0]?.status === 'idle',
     );
-    assert.ok(session!.messages.some((message) => message.text === 'Native answer'));
-    const sent = () => session!.send!('same-message', 'wait');
-    await Promise.all([sent(), sent()]);
+    assert.ok(
+      (await session!.readMessages!()).messages.some((message) => message.text === 'Native answer'),
+    );
+    await session!.send!('message', 'wait');
     [session] = await native.junie.refresh();
     assert.equal(session!.status, 'working');
     assert.ok(session!.stop);
@@ -190,7 +189,9 @@ test('Junie loads saved history under the original ID and never substitutes a ne
     );
     assert.equal(session!.id, 'saved-native-id');
     assert.deepEqual(
-      session!.messages.filter((message) => message.role !== 'tool').map((message) => message.text),
+      (await session!.readMessages!()).messages
+        .filter((message) => message.role !== 'tool')
+        .map((message) => message.text),
       ['Saved question', 'Saved answer', 'Follow up', 'Native answer'],
     );
     const calls = await native.calls();
@@ -445,7 +446,10 @@ child.on('exit',code=>process.exit(code??0));
         () => junie.refresh(),
         (sessions) => sessions[0]?.status === 'idle',
       );
-      assert.ok(session!.messages.some((message) => message.text.includes('Native local hello')));
+      assert.ok(
+        (await session!.readMessages!()).messages.some((message) =>
+          message.text.includes('Native local hello')),
+      );
       assert.ok(requests.length > 0 && requests.every((model) => model === 'local-test'));
       const [saved] = await until(
         async () => scanJunieHistories().sessions,
@@ -465,7 +469,10 @@ child.on('exit',code=>process.exit(code??0));
         (sessions) => sessions[0]?.status === 'idle',
       );
       assert.equal(resumed!.id, id);
-      assert.ok(resumed!.messages.some((message) => message.text.includes('Native local hello')));
+      assert.ok(
+        (await resumed!.readMessages!()).messages.some((message) =>
+          message.text.includes('Native local hello')),
+      );
     } finally {
       junie.stop();
       server.closeAllConnections();

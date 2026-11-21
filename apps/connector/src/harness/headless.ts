@@ -4,10 +4,11 @@ import { readFile } from 'node:fs/promises';
 import { basename } from 'node:path';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 
-import type { Approval, Message, ThreadSummary } from '@dashup/protocol';
+import type { Approval, AgentOption, ThreadSummary } from '@dashup/protocol';
 
-import { attached, INPUT_IMAGE_TYPES, type Settings, type InputFile, type LiveSession } from './session';
-import { ask, decide, claudeModels, claudeOptions, type PermissionRequest } from './claude';
+import { commandVersion } from './processes';
+import { hand, attached, debounced, firstLine, INPUT_IMAGE_TYPES, HostedConversation, type Settings, type InputFile, type LiveSession } from './session';
+import { ask, decide, claudeModels, claudeOptions, forgetModels, type PermissionRequest } from './claude';
 
 // =============================================================================
 // Claude Code sessions Dashup starts
@@ -16,8 +17,6 @@ import { ask, decide, claudeModels, claudeOptions, type PermissionRequest } from
 // Each turn runs Claude Code's headless JSON mode in the project, and the phone answers its
 // permission requests as its host. Nothing runs between turns: the next message resumes the
 // session.
-const MAX_REQUESTS = 1_000;
-const NOTIFY_MS    = 100;
 // The Claude Code setting each switch is.
 const SWITCHES: Record<string, string> = { fast: 'fastMode', ultracode: 'ultracode' };
 
@@ -25,16 +24,15 @@ type Data    = Record<string, any>;
 type Pending = { control: string; request: PermissionRequest; approval: Approval };
 
 class Session {
-  readonly messages: Message[] = [];
   status: ThreadSummary['status'] = 'idle';
   updatedAt = new Date().toISOString();
+  private readonly conversation = new HostedConversation(() => !!this.turn);
   private turn?: ChildProcessWithoutNullStreams;
   // Messages written to this turn's process that Claude Code has not finished answering.
   private open = 0;
   // The text Claude Code is writing, as far as it has streamed.
   private typing = '';
   private readonly approvals = new Map<string, Pending>();
-  private readonly requests = new Map<string, Promise<void>>();
   // What the person chose for this session, applied to each turn as it starts.
   private readonly chosen: Settings = {};
   private mode?: string;
@@ -77,16 +75,6 @@ class Session {
     });
   }
 
-  private once(id: string, action: () => Promise<void>): Promise<void> {
-    const known = this.requests.get(id);
-    if (known) return known;
-    if (this.requests.size >= MAX_REQUESTS)
-      throw new Error('Claude Code command history is full; restart Dashup before sending');
-    const result = action();
-    this.requests.set(id, result);
-    return result;
-  }
-
   // Resolves once Claude Code takes the message, or says why it could not start. `now` stops the
   // turn under way, so Claude Code takes the message at once.
   async say(text: string, now = false, files: InputFile[] = []): Promise<void> {
@@ -102,7 +90,7 @@ class Session {
       })),
     );
     const id = randomUUID();
-    this.messages.push({
+    this.conversation.messages.push({
       id,
       role: 'user',
       text,
@@ -175,6 +163,7 @@ class Session {
         for (const pending of this.controls.values()) pending.reject(new Error(reason));
         this.controls.clear();
         this.status = 'idle';
+        this.conversation.ended();
         this.changed();
       };
       turn.once('error', () => end('Claude Code is not installed on this computer'));
@@ -219,7 +208,11 @@ class Session {
         .join('\n\n');
       if (!text) return false;
       // Claude Code sends each part of a reply on its own, under the reply's ID and the part's UUID.
-      this.messages.push({ id: String(message.uuid ?? randomUUID()), role: 'assistant', text });
+      this.conversation.messages.push({
+        id: String(message.uuid ?? randomUUID()),
+        role: 'assistant',
+        text,
+      });
     } else if (message.type === 'control_request' && message.request?.subtype === 'can_use_tool') {
       const id      = randomUUID();
       const asked   = message.request;
@@ -262,7 +255,7 @@ class Session {
     return init;
   }
 
-  live(models: ReturnType<typeof claudeModels>): LiveSession {
+  live(models: ReturnType<typeof claudeModels>): LiveSession<'claude'> {
     return {
       id: this.id,
       cwd: this.cwd,
@@ -270,10 +263,11 @@ class Session {
       harness: 'claude',
       updatedAt: this.updatedAt,
       status: this.status,
-      messages: [...this.messages],
+      readMessages: this.conversation.read,
+      releaseMessages: this.conversation.release,
       typing: this.typing,
       approvals: [...this.approvals.values()].map((pending) => pending.approval),
-      send: (requestId, text, now, files) => this.once(requestId, () => this.say(text, now, files)),
+      send: (_requestId, text, now, files) => this.say(text, now, files),
       now: true,
       options: (recorded) =>
         claudeOptions(models, {
@@ -281,60 +275,57 @@ class Session {
           ...(this.mode ? { auto: this.mode === 'auto' } : {}),
           ...this.chosen,
         }),
-      configure: (requestId, option, value) =>
-        this.once(requestId, async () => {
-          if (option === 'auto' && this.turn) {
-            await new Promise<void>((resolve, reject) => {
-              const id = randomUUID();
-              const timer = setTimeout(() => {
-                this.controls.delete(id);
-                reject(new Error('Claude mode change timed out'));
-              }, 10_000);
-              this.controls.set(id, {
-                resolve: () => {
-                  clearTimeout(timer);
-                  resolve();
-                },
-                reject: (error) => {
-                  clearTimeout(timer);
-                  reject(error);
-                },
-              });
-              this.write({
-                type: 'control_request',
-                request_id: id,
-                request: { subtype: 'set_permission_mode', mode: value ? 'auto' : 'default' },
-              });
+      configure: async (_requestId, option, value) => {
+        if (option === 'auto' && this.turn) {
+          await new Promise<void>((resolve, reject) => {
+            const id = randomUUID();
+            const timer = setTimeout(() => {
+              this.controls.delete(id);
+              reject(new Error('Claude mode change timed out'));
+            }, 10_000);
+            this.controls.set(id, {
+              resolve: () => {
+                clearTimeout(timer);
+                resolve();
+              },
+              reject: (error) => {
+                clearTimeout(timer);
+                reject(error);
+              },
             });
-          } else this.apply(option, value);
-          this.chosen[option] = value;
-          this.changed();
-        }),
+            this.write({
+              type: 'control_request',
+              request_id: id,
+              request: { subtype: 'set_permission_mode', mode: value ? 'auto' : 'default' },
+            });
+          });
+        } else this.apply(option, value);
+        this.chosen[option] = value;
+        this.changed();
+      },
       stop: this.turn
-        ? (requestId) =>
-            this.once(requestId, async () => {
-              if (!this.turn) throw new Error('Nothing is running in this Claude Code session');
-              this.interrupt();
-            })
+        ? async () => {
+            if (!this.turn) throw new Error('Nothing is running in this Claude Code session');
+            this.interrupt();
+          }
         : undefined,
       approve: this.approvals.size
-        ? (requestId, approvalId, reply) =>
-            this.once(requestId, async () => {
-              const pending = this.approvals.get(approvalId);
-              if (!pending || !this.turn)
-                throw new Error('Claude Code approval is no longer pending');
-              this.write({
-                type: 'control_response',
-                response: {
-                  subtype: 'success',
-                  request_id: pending.control,
-                  response: decide(pending.request, pending.approval, reply),
-                },
-              });
-              this.approvals.delete(approvalId);
-              if (!this.approvals.size) this.status = 'working';
-              this.changed();
-            })
+        ? async (_requestId, approvalId, reply) => {
+            const pending = this.approvals.get(approvalId);
+            if (!pending || !this.turn)
+              throw new Error('Claude Code approval is no longer pending');
+            this.write({
+              type: 'control_response',
+              response: {
+                subtype: 'success',
+                request_id: pending.control,
+                response: decide(pending.request, pending.approval, reply),
+              },
+            });
+            this.approvals.delete(approvalId);
+            if (!this.approvals.size) this.status = 'working';
+            this.changed();
+          }
         : undefined,
     };
   }
@@ -345,54 +336,52 @@ class Session {
 }
 
 export class Headless {
+  readonly harness = 'claude';
   private readonly sessions = new Map<string, Session>();
-  private notify?: ReturnType<typeof setTimeout>;
+  private readonly soon = debounced(() => this.changed());
+  private version?: string;
 
   constructor(private readonly changed: () => void) {}
 
-  private readonly soon = (): void => {
-    if (this.notify) return;
-    this.notify = setTimeout(() => {
-      this.notify = undefined;
-      this.changed();
-    }, NOTIFY_MS);
-    this.notify.unref();
-  };
+  // Whether Claude Code's command runs on this computer. An updated one is asked its models again.
+  async available(): Promise<boolean> {
+    const version = await commandVersion('claude');
+    if (version !== this.version) forgetModels();
+    this.version = version;
+    return version !== undefined;
+  }
+
+  models(): NonNullable<AgentOption['choices']> {
+    return claudeModels(this.changed).map(({ value, displayName }) => ({
+      value,
+      name: displayName,
+    }));
+  }
+
+  recorded(settings: Settings): AgentOption[] {
+    return claudeOptions(claudeModels(this.changed), settings);
+  }
 
   // Starts a session in `cwd` with its first message, and resolves with the session's id.
   async start(cwd: string, text: string, files?: InputFile[], model?: string): Promise<string> {
-    const title = text.trim().split('\n')[0]!.slice(0, 80);
-    const session = new Session(randomUUID(), cwd, title, this.soon, false, model);
-    this.sessions.set(session.id, session);
-    try {
-      await session.say(text, false, files);
-    } catch (error) {
-      this.sessions.delete(session.id);
-      throw error;
-    }
+    const session = new Session(randomUUID(), cwd, firstLine(text), this.soon, false, model);
+    await hand(this.sessions, session, () => session.say(text, false, files));
     return session.id;
   }
 
   // Continues a saved session with a message; Claude Code resumes it from its own transcript.
   async resume(id: string, cwd: string, text: string, files?: InputFile[]): Promise<void> {
-    const known = this.sessions.get(id);
-    const session = known ?? new Session(id, cwd, undefined, this.soon, true);
-    this.sessions.set(id, session);
-    try {
-      await session.say(text, false, files);
-    } catch (error) {
-      if (!known) this.sessions.delete(id);
-      throw error;
-    }
+    const session = this.sessions.get(id) ?? new Session(id, cwd, undefined, this.soon, true);
+    await hand(this.sessions, session, () => session.say(text, false, files));
   }
 
-  async refresh(): Promise<LiveSession[]> {
+  async refresh(): Promise<LiveSession<'claude'>[]> {
     const models = claudeModels(this.changed);
     return [...this.sessions.values()].map((session) => session.live(models));
   }
 
   stop(): void {
-    clearTimeout(this.notify);
+    this.soon.cancel();
     for (const session of this.sessions.values()) session.end();
   }
 }

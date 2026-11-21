@@ -1,14 +1,13 @@
 import { homedir } from 'node:os';
-import { constants } from 'node:fs';
+import { lstat } from 'node:fs/promises';
 import { createConnection } from 'node:net';
 import { join, isAbsolute } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { open, lstat, stat } from 'node:fs/promises';
 
 import type { Message, Approval, ApprovalReply } from '@dashup/protocol';
 
-import { privateRecord } from './local-file';
-import { MAX_PREVIEW, NO_PREVIEW, type InputFile, type LiveSession } from './session';
+import { readRecord, ownProcess } from './local-file';
+import { bounded, MAX_PREVIEW, NO_PREVIEW, singleFlight, liveDiscovery, type Page, type InputFile, type LiveSession } from './session';
 
 // =============================================================================
 // Existing Orca runtimes (published local CLI IPC, v1.4.244)
@@ -16,15 +15,12 @@ import { MAX_PREVIEW, NO_PREVIEW, type InputFile, type LiveSession } from './ses
 
 const REQUEST_MS   = 4_000;
 const SELECTED_MS  = 350;
-const MAX_RECORD   = 64 * 1024;
 const MAX_BYTES    = 2 * 1024 * 1024;
 const MAX_SESSIONS = 100;
 const PAGE_ITEMS   = 30;
-const MAX_OPERATIONS = 1_000;
 
 type Data = Record<string, any>;
 type Owner = { runtimeId: string; pid: number; endpoint: string; authToken: string | null };
-type Page = { messages: Message[]; more: boolean };
 
 function dataPath(): string {
   return (
@@ -39,65 +35,46 @@ function dataPath(): string {
 
 async function owner(): Promise<Owner | undefined> {
   const explicit = process.env.DASHUP_ORCA_DISCOVERY_PATH?.trim();
-  if (process.env.DASHUP_LIVE_DISCOVERY === '0' && !explicit) return;
+  if (!liveDiscovery() && !explicit) return;
   const path = explicit || join(dataPath(), 'orca-runtime.json');
-  if (!(await privateRecord(path, MAX_RECORD))) return;
-  const file = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-  try {
-    const info = await file.stat();
+  const value = await readRecord(path);
+  if (
+    typeof value?.runtimeId !== 'string' ||
+    !value.runtimeId ||
+    !Number.isSafeInteger(value.pid) ||
+    value.pid <= 0 ||
+    !(
+      value.authToken === null ||
+      (typeof value.authToken === 'string' && value.authToken.length <= 4096)
+    ) ||
+    !(await ownProcess(value.pid))
+  )
+    return;
+  const transports = Array.isArray(value.transports) ? value.transports : [value.transport];
+  const transport = transports.find(
+    (item: Data) => item?.kind === (process.platform === 'win32' ? 'named-pipe' : 'unix'),
+  );
+  if (typeof transport?.endpoint !== 'string' || transport.endpoint.length > 4096) return;
+  if (process.platform === 'win32') {
+    if (!transport.endpoint.startsWith('\\\\.\\pipe\\')) return;
+  } else {
+    if (!isAbsolute(transport.endpoint)) return;
+    const socket = await lstat(transport.endpoint);
     if (
-      !info.isFile() ||
-      info.size > MAX_RECORD ||
-      (process.getuid && (info.uid !== process.getuid() || (info.mode & 0o077) !== 0))
+      !socket.isSocket() ||
+      socket.isSymbolicLink() ||
+      !process.getuid ||
+      socket.uid !== process.getuid() ||
+      (socket.mode & 0o077) !== 0
     )
       return;
-    const value = JSON.parse(await file.readFile('utf8'));
-    if (
-      typeof value?.runtimeId !== 'string' ||
-      !value.runtimeId ||
-      !Number.isSafeInteger(value.pid) ||
-      value.pid <= 0 ||
-      !(
-        value.authToken === null ||
-        (typeof value.authToken === 'string' && value.authToken.length <= 4096)
-      )
-    )
-      return;
-    process.kill(value.pid, 0);
-    if (
-      process.platform === 'linux' &&
-      process.getuid &&
-      (await stat(`/proc/${value.pid}`)).uid !== process.getuid()
-    )
-      return;
-    const transports = Array.isArray(value.transports) ? value.transports : [value.transport];
-    const transport = transports.find(
-      (item: Data) => item?.kind === (process.platform === 'win32' ? 'named-pipe' : 'unix'),
-    );
-    if (typeof transport?.endpoint !== 'string' || transport.endpoint.length > 4096) return;
-    if (process.platform === 'win32') {
-      if (!transport.endpoint.startsWith('\\\\.\\pipe\\')) return;
-    } else {
-      if (!isAbsolute(transport.endpoint)) return;
-      const socket = await lstat(transport.endpoint);
-      if (
-        !socket.isSocket() ||
-        socket.isSymbolicLink() ||
-        !process.getuid ||
-        socket.uid !== process.getuid() ||
-        (socket.mode & 0o077) !== 0
-      )
-        return;
-    }
-    return {
-      runtimeId: value.runtimeId,
-      pid: value.pid,
-      endpoint: transport.endpoint,
-      authToken: value.authToken,
-    };
-  } finally {
-    await file.close();
   }
+  return {
+    runtimeId: value.runtimeId,
+    pid: value.pid,
+    endpoint: transport.endpoint,
+    authToken: value.authToken,
+  };
 }
 
 // IPC credentials and content never leave this computer. The runtime id fences every response.
@@ -263,10 +240,9 @@ function approvals(page: Data): { values: Approval[]; rows: Map<string, Data> } 
 }
 
 class Conversation {
-  readonly live: LiveSession;
+  readonly live: LiveSession<'orca'>;
   private fence?: number;
   private pending = new Map<string, Data>();
-  private operations = new Map<string, { fingerprint: string; promise: Promise<void> }>();
   private selected?: ReturnType<typeof setTimeout>;
   private generation = 0;
   private disposed = false;
@@ -285,9 +261,8 @@ class Conversation {
       harness: 'orca',
       updatedAt: new Date(0).toISOString(),
       status: 'idle',
-      messages: [],
       approvals: [],
-      readMessages: (before) => this.read(before),
+      readMessages: (before) => this.read(before).then(bounded),
       releaseMessages: () => this.release(),
       send: (requestId, text, _now, files) => this.send(requestId, text, files),
       stop: (requestId) => this.mutate(requestId, 'agentSession.cancel', {}, {}),
@@ -381,33 +356,20 @@ class Conversation {
     fingerprintMethod = method,
   ): Promise<void> {
     if (this.disposed) throw new Error('Orca session is no longer available');
-    const fingerprint = orcaFingerprint(fingerprintMethod, this.live.id, fields);
-    const prior = this.operations.get(requestId);
-    if (prior) {
-      if (prior.fingerprint !== fingerprint)
-        throw new Error('Orca request id was already used for another action');
-      return prior.promise;
-    }
-    if (this.operations.size >= MAX_OPERATIONS)
-      throw new Error('Reconnect Orca before sending more requests');
-    const promise = (async () => {
-      if (!this.fence) await this.read();
-      if (!this.fence) throw new Error('Orca did not provide a current runtime fence');
-      const result = await call(this.native, method, {
-        ...params,
-        envelope: {
-          sessionId: this.live.id,
-          clientOperationId: `${Date.now()}-${createHash('sha256').update(requestId).digest('hex').slice(0, 32)}`,
-          expectedRuntimeFence: this.fence,
-          payloadFingerprint: fingerprint,
-        },
-      });
-      if (result?.ok !== true)
-        throw new Error('Orca did not accept this action; check the session on your computer');
-      this.changed();
-    })();
-    this.operations.set(requestId, { fingerprint, promise });
-    return promise;
+    if (!this.fence) await this.read();
+    if (!this.fence) throw new Error('Orca did not provide a current runtime fence');
+    const result = await call(this.native, method, {
+      ...params,
+      envelope: {
+        sessionId: this.live.id,
+        clientOperationId: `${Date.now()}-${createHash('sha256').update(requestId).digest('hex').slice(0, 32)}`,
+        expectedRuntimeFence: this.fence,
+        payloadFingerprint: orcaFingerprint(fingerprintMethod, this.live.id, fields),
+      },
+    });
+    if (result?.ok !== true)
+      throw new Error('Orca did not accept this action; check the session on your computer');
+    this.changed();
   }
 
   private send(requestId: string, text: string, files?: InputFile[]): Promise<void> {
@@ -461,27 +423,19 @@ class Conversation {
 // =============================================================================
 
 export class Orca {
+  readonly harness = 'orca';
   private runtime?: Owner;
   private readonly conversations = new Map<string, Conversation>();
   private stopped = false;
-  private refreshing?: Promise<LiveSession[]>;
+  private readonly discovering = singleFlight(() => this.discover());
 
   constructor(private readonly changed: () => void) {}
 
-  refresh(): Promise<LiveSession[]> {
-    if (this.stopped) return Promise.resolve([]);
-    if (this.refreshing) return this.refreshing;
-    const pending = this.discover();
-    this.refreshing = pending;
-    void pending
-      .finally(() => {
-        if (this.refreshing === pending) this.refreshing = undefined;
-      })
-      .catch(() => {});
-    return pending;
+  refresh(): Promise<LiveSession<'orca'>[]> {
+    return this.stopped ? Promise.resolve([]) : this.discovering();
   }
 
-  private async discover(): Promise<LiveSession[]> {
+  private async discover(): Promise<LiveSession<'orca'>[]> {
     if (this.stopped) return [];
     const native = await owner().catch(() => undefined);
     if (this.stopped) return [];

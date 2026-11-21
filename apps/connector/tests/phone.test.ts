@@ -39,11 +39,12 @@ test('phone tools require an open paired phone and return only that phone’s en
           stream: '01'.repeat(16),
           sequence: sent.length + 1,
         },
+        '02'.repeat(16),
         content,
         randomBytes,
       );
       assert.equal(JSON.stringify(packet).includes('Pick the deployment colour'), false);
-      sent.push(openSession(key, packet) as PhoneContent);
+      sent.push(openSession(key, packet, '02'.repeat(16)) as PhoneContent);
     },
     receive: async () => [{ path: '/private/phone/photo.png', mime: 'image/png' }],
   });
@@ -84,10 +85,11 @@ test('phone tools require an open paired phone and return only that phone’s en
       stream: '02'.repeat(16),
       sequence: 1,
     },
+    '01'.repeat(16),
     { type: 'phone.response', requestId: request.request.id, status: 'completed', choice: 'Green' },
     randomBytes,
   );
-  await tools.receive(pair.id, openSession(key, packet) as PhoneContent);
+  await tools.receive(pair.id, openSession(key, packet, '01'.repeat(16)) as PhoneContent);
   assert.equal((await result).choice, 'Green');
   tools.disconnect();
 });
@@ -280,10 +282,11 @@ test('the actual phone-tools CLI speaks MCP through the authenticated loopback c
           stream: '01'.repeat(16),
           sequence: ++sequence,
         },
+        '02'.repeat(16),
         content,
         randomBytes,
       );
-      const opened = openSession(key, wire);
+      const opened = openSession(key, wire, '02'.repeat(16));
       if (opened.type !== 'phone.request') return;
       assert.equal(JSON.stringify(wire).includes('Use the phone'), false);
       queueMicrotask(() => {
@@ -296,6 +299,7 @@ test('the actual phone-tools CLI speaks MCP through the authenticated loopback c
             stream: '02'.repeat(16),
             sequence: ++sequence,
           },
+          '01'.repeat(16),
           {
             type: 'phone.response',
             requestId: opened.request.id,
@@ -304,7 +308,7 @@ test('the actual phone-tools CLI speaks MCP through the authenticated loopback c
           },
           randomBytes,
         );
-        void tools.receive(pair.id, openSession(key, response) as PhoneContent);
+        void tools.receive(pair.id, openSession(key, response, '01'.repeat(16)) as PhoneContent);
       });
     },
   });

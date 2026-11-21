@@ -18,7 +18,6 @@ export const PI_MAX_TEXT    = 64 * 1024;
 export const PI_MAX_ENTRIES = 200;
 export const PI_MAX_HISTORY = 512 * 1024;
 export const PI_MAX_COMMAND = 128 * 1024;
-export const PI_MAX_REQUESTS = 1_000;
 
 export type PiEntry = {
   id        : string;
@@ -59,8 +58,13 @@ export type PiCommand = {
   now?    : boolean;
 };
 
+// Where a connector meets the extensions that run inside its agents. They run with the person's
+// environment, not the connector's, so it is the person's own Dashup folder whatever state file a
+// connector runs with.
+export const dashupHome = (): string => join(homedir(), '.dashup');
+
 export const piDirectory = (): string =>
-  resolve(process.env.DASHUP_PI_DIRECTORY ?? join(homedir(), '.dashup', 'pi'));
+  resolve(process.env.DASHUP_PI_DIRECTORY ?? join(dashupHome(), 'pi'));
 
 // Registry ownership authenticates the local host before its token is sent. Symlinks and
 // shared directories are refused; the bridge never binds a non-loopback interface.

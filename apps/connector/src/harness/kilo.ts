@@ -1,54 +1,28 @@
 import { homedir } from 'node:os';
 import { join, isAbsolute } from 'node:path';
-import { constants } from 'node:fs';
-import { open, stat } from 'node:fs/promises';
-import { createHash } from 'node:crypto';
 
 import type { Message, Approval } from '@dashup/protocol';
 
-import { localEndpoint } from './opencode';
-import { privateRecord } from './local-file';
-import { EARLIER, toolInput, MAX_PREVIEW, NO_PREVIEW, questionApproval, type LiveSession } from './session';
+import { readRecord, ownProcess } from './local-file';
+import { messageId, localEndpoint, PERMISSION_CHOICES } from './opencode';
+import { frames, request, subscribe, EventStream, type Endpoint } from './local-http';
+import { EARLIER, debounced, toolInput, MAX_PREVIEW, NO_PREVIEW, liveDiscovery, questionApproval, type LiveSession } from './session';
 
 // =============================================================================
 // Kilo's existing local daemon
 // =============================================================================
 
-const REQUEST_MS     = 4_000;
-const RECONNECT_MS   = 2_000;
-const EVENT_DELAY_MS = 100;
-const MAX_RECORD     = 64 * 1024;
-const MAX_BYTES      = 8 * 1024 * 1024;
-const MAX_SESSIONS   = 100;
-const MAX_MESSAGES   = 200;
-const MAX_REQUESTS   = 1_000;
-const DECISIONS      = [
-  { id: 'once', label: 'Allow once' },
-  { id: 'always', label: 'Always allow' },
-  { id: 'reject', label: 'Reject' },
-];
+const MAX_SESSIONS = 100;
+const MAX_MESSAGES = 200;
+const DAEMON       = { name: 'Kilo', asked: 'Kilo request', folder: 'x-kilo-directory' };
 
-type Data     = Record<string, any>;
-type Endpoint = { url: string; authorization: string; identity: string };
+type Data = Record<string, any>;
 
 async function owner(path: string): Promise<Endpoint | undefined> {
   try {
-    if (!(await privateRecord(path, MAX_RECORD))) return;
-    const file = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-    let value: Data;
-    try {
-      const info = await file.stat();
-      if (
-        !info.isFile() ||
-        info.size > MAX_RECORD ||
-        (process.getuid && (info.uid !== process.getuid() || (info.mode & 0o077) !== 0))
-      )
-        return;
-      value = JSON.parse(await file.readFile('utf8'));
-    } finally {
-      await file.close();
-    }
+    const value = await readRecord(path);
     if (
+      value === undefined ||
       !Number.isSafeInteger(value.pid) ||
       value.pid <= 0 ||
       typeof value.url !== 'string' ||
@@ -56,20 +30,13 @@ async function owner(path: string): Promise<Endpoint | undefined> {
       typeof value.password !== 'string' ||
       !value.password ||
       /[:\r\n]/.test(value.username) ||
-      /[\r\n]/.test(value.password)
-    )
-      return;
-    process.kill(value.pid, 0);
-    if (
-      process.platform === 'linux' &&
-      process.getuid &&
-      (await stat(`/proc/${value.pid}`)).uid !== process.getuid()
+      /[\r\n]/.test(value.password) ||
+      !(await ownProcess(value.pid))
     )
       return;
     return {
       url           : localEndpoint(value.url),
       authorization : `Basic ${Buffer.from(`${value.username}:${value.password}`).toString('base64')}`,
-      identity      : `${value.pid}:${value.startedAt ?? ''}`,
     };
   } catch {
     return;
@@ -78,7 +45,7 @@ async function owner(path: string): Promise<Endpoint | undefined> {
 
 async function endpoint(): Promise<Endpoint | undefined> {
   if (process.env.DASHUP_KILO_DAEMON) return owner(process.env.DASHUP_KILO_DAEMON);
-  if (process.env.DASHUP_LIVE_DISCOVERY === '0') return;
+  if (!liveDiscovery()) return;
   // Kilo keeps an existing data/state fallback after a migration; an explicit XDG state wins.
   const paths = process.env.XDG_STATE_HOME
     ? [join(process.env.XDG_STATE_HOME, 'kilo/daemon.json')]
@@ -100,21 +67,6 @@ const clipped = (text: unknown, max = MAX_PREVIEW): string =>
   typeof text === 'string' ? Buffer.from(text).subarray(0, max).toString('utf8') : '';
 const timestamp = (value: unknown): string =>
   new Date(typeof value === 'number' && Number.isFinite(value) ? value : 0).toISOString();
-
-async function* bytes(body: ReadableStream<Uint8Array> | null): AsyncGenerator<Uint8Array> {
-  if (!body) return;
-  const reader = body.getReader();
-  try {
-    for (;;) {
-      const next = await reader.read();
-      if (next.done) return;
-      yield next.value;
-    }
-  } finally {
-    await reader.cancel().catch(() => {});
-    reader.releaseLock();
-  }
-}
 
 function messages(listed: Data): Message[] {
   const result: Message[] = listed.cursor?.next ? [EARLIER] : [];
@@ -194,7 +146,7 @@ function permission(request: Data): Approval {
     id      : request.id,
     title   : `Allow ${clipped(request.action, 256) || 'this'}?`,
     detail  : preview ? detail : NO_PREVIEW,
-    choices : DECISIONS.filter((choice) =>
+    choices : PERMISSION_CHOICES.filter((choice) =>
       preview ? choice.id !== 'always' || scope.length > 0 : choice.id === 'reject').map((
       choice,
     ) => ({ ...choice })),
@@ -207,12 +159,11 @@ function permission(request: Data): Approval {
 }
 
 export class Kilo {
+  readonly harness = 'kilo';
   private endpoint?: Endpoint;
-  private stream?: AbortController;
-  private retry?: ReturnType<typeof setTimeout>;
-  private notify?: ReturnType<typeof setTimeout>;
+  private events?: EventStream;
   private stopped = false;
-  private readonly requests = new Map<string, Promise<void>>();
+  private readonly soon = debounced(() => this.changed());
   private readonly typing = new Map<string, { id: string; text: string }>();
 
   constructor(private readonly changed: () => void) {}
@@ -223,6 +174,13 @@ export class Kilo {
     if (JSON.stringify(found) !== JSON.stringify(this.endpoint)) {
       this.close();
       this.endpoint = found;
+      this.events =
+        found &&
+        new EventStream(
+          (stream) => this.receive(found, stream),
+          () => this.typing.clear(),
+          () => this.changed(),
+        );
     }
     return this.endpoint;
   }
@@ -242,40 +200,8 @@ export class Kilo {
   private async request(host: Endpoint, path: string, cwd?: string, payload?: Data): Promise<Data> {
     if (this.stopped || this.endpoint !== host)
       throw new Error('Kilo connection changed; refresh the thread');
-    const response = await fetch(host.url + path, {
-      method   : payload ? 'POST' : 'GET',
-      headers  : {
-        Authorization : host.authorization,
-        ...(cwd ? { 'x-kilo-directory': cwd } : {}),
-        ...(payload ? { 'Content-Type': 'application/json' } : {}),
-      },
-      ...(payload ? { body: JSON.stringify(payload) } : {}),
-      redirect : 'error',
-      signal   : AbortSignal.timeout(REQUEST_MS),
-    });
-    if (!response.ok) {
-      await response.body?.cancel();
-      throw new Error(`Kilo request failed (${response.status})`);
-    }
-    const chunks: Uint8Array[] = [];
-    let size = 0;
-    for await (const chunk of bytes(response.body)) {
-      size += chunk.length;
-      if (size > MAX_BYTES) throw new Error('Kilo response exceeds the local content limit');
-      chunks.push(chunk);
-    }
-    return size ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
-  }
-
-  private once(host: Endpoint, id: string, action: () => Promise<void>): Promise<void> {
-    const key = `${host.identity}\0${id}`;
-    const known = this.requests.get(key);
-    if (known) return known;
-    if (this.requests.size >= MAX_REQUESTS)
-      throw new Error('Kilo command history is full; restart Dashup before sending');
-    const pending = action();
-    this.requests.set(key, pending);
-    return pending;
+    const answer = await request(host, DAEMON, path, cwd, payload);
+    return answer === undefined ? {} : answer;
   }
 
   async start(cwd: string, text: string): Promise<string> {
@@ -297,7 +223,7 @@ export class Kilo {
     this.changed();
   }
 
-  async refresh(): Promise<LiveSession[]> {
+  async refresh(): Promise<LiveSession<'kilo'>[]> {
     const host = await this.connect();
     if (!host) return [];
     const health = await this.request(host, '/global/health');
@@ -306,18 +232,17 @@ export class Kilo {
       this.request(host, `/api/session?limit=${MAX_SESSIONS}`),
       this.request(host, '/api/session/active'),
     ]);
-    this.listen(host);
+    this.events?.open();
     const sessions: Data[] = (Array.isArray(listed.data) ? listed.data : []).slice(0, MAX_SESSIONS);
     const current = new Set(sessions.map((session) => session.id));
     for (const id of this.typing.keys()) if (!current.has(id)) this.typing.delete(id);
     const result = await Promise.allSettled(
-      sessions.map(async (session): Promise<LiveSession | undefined> => {
+      sessions.map(async (session): Promise<LiveSession<'kilo'> | undefined> => {
         const id = session.id;
         const cwd = session.location?.directory;
         if (typeof id !== 'string' || typeof cwd !== 'string' || !isAbsolute(cwd)) return;
         const path = `/api/session/${encodeURIComponent(id)}`;
-        const [history, pending, questions] = await Promise.all([
-          this.request(host, `${path}/message?limit=${MAX_MESSAGES}&order=desc`, cwd),
+        const [pending, questions] = await Promise.all([
           this.request(host, `${path}/permission`, cwd),
           this.request(host, `${path}/question`, cwd),
         ]);
@@ -338,10 +263,7 @@ export class Kilo {
             );
         const running = !!active.data?.[id];
         if (!running) this.typing.delete(id);
-        const conversation = messages(history);
-        const draft = this.typing.get(id);
-        if (draft && conversation.some((item) => item.id === draft.id && item.text === draft.text))
-          this.typing.delete(id);
+        const drafts = this.typing;
         return {
           id,
           cwd,
@@ -349,76 +271,87 @@ export class Kilo {
           title     : clipped(session.title, 1000) || 'Kilo Code thread',
           updatedAt : timestamp(session.time?.updated),
           status    : approvals.length || asked.length ? 'attention' : running ? 'working' : 'idle',
-          messages  : conversation,
-          ...(running && this.typing.get(id)?.text ? { typing: this.typing.get(id)!.text } : {}),
+          // The reply being written goes once the conversation holds it, so it is read after.
+          readMessages : async () => {
+            const conversation = messages(
+              await this.request(host, `${path}/message?limit=${MAX_MESSAGES}&order=desc`, cwd),
+            );
+            const draft = drafts.get(id);
+            if (
+              draft &&
+              conversation.some((item) => item.id === draft.id && item.text === draft.text)
+            )
+              drafts.delete(id);
+            return { messages: conversation, more: false };
+          },
+          get typing() {
+            return (running && drafts.get(id)?.text) || undefined;
+          },
           approvals,
           stop      : running
-            ? (requestId) =>
-                this.once(host, requestId, async () => {
-                  await this.request(host, `${path}/interrupt`, cwd, {});
-                  this.changed();
-                })
+            ? async () => {
+                await this.request(host, `${path}/interrupt`, cwd, {});
+                this.changed();
+              }
             : undefined,
-          send      : (requestId, text, now) =>
-            this.once(host, requestId, async () => {
-              await this.request(host, `${path}/prompt`, cwd, {
-                id     : `msg_${createHash('sha256').update(requestId).digest('hex').slice(0, 32)}`,
-                prompt : { text },
-                ...(running ? { delivery: now ? 'steer' : 'queue' } : {}),
-              });
-              this.changed();
-            }),
+          send      : async (requestId, text, now) => {
+            await this.request(host, `${path}/prompt`, cwd, {
+              id     : messageId(requestId),
+              prompt : { text },
+              ...(running ? { delivery: now ? 'steer' : 'queue' } : {}),
+            });
+            this.changed();
+          },
           now       : true,
           approve   : approvals.length
-            ? (requestId, approvalId, reply) =>
-                this.once(host, requestId, async () => {
-                  const approval = approvals.find((item) => item.id === approvalId);
-                  if (!approval) throw new Error('Kilo is no longer asking');
-                  if (approvalId.startsWith('question:')) {
-                    const question = asked.find((item) => `question:${item.id}` === approvalId)!;
-                    if ('answers' in reply) {
-                      if (
-                        reply.answers.length !== question.questions.length ||
-                        question.questions.some(
-                          (item: Data, index: number) =>
-                            (!item.multiple && reply.answers[index]!.length > 1) ||
-                            (item.custom === false &&
-                              reply.answers[index]!.some(
-                                (answer) =>
-                                  !item.options.some((option: Data) => option.label === answer),
-                              )),
-                        )
-                      )
-                        throw new Error('Answer Kilo with the offered choices');
-                      await this.request(
-                        host,
-                        `${path}/question/${encodeURIComponent(question.id)}/reply`,
-                        cwd,
-                        { answers: reply.answers },
-                      );
-                    } else if (reply.choice === 'skip')
-                      await this.request(
-                        host,
-                        `${path}/question/${encodeURIComponent(question.id)}/reject`,
-                        cwd,
-                        {},
-                      );
-                    else throw new Error('Kilo did not offer that answer');
-                  } else {
+            ? async (_requestId, approvalId, reply) => {
+                const approval = approvals.find((item) => item.id === approvalId);
+                if (!approval) throw new Error('Kilo is no longer asking');
+                if (approvalId.startsWith('question:')) {
+                  const question = asked.find((item) => `question:${item.id}` === approvalId)!;
+                  if ('answers' in reply) {
                     if (
-                      !('choice' in reply) ||
-                      !approval.choices.some((choice) => choice.id === reply.choice)
+                      reply.answers.length !== question.questions.length ||
+                      question.questions.some(
+                        (item: Data, index: number) =>
+                          (!item.multiple && reply.answers[index]!.length > 1) ||
+                          (item.custom === false &&
+                            reply.answers[index]!.some(
+                              (answer) =>
+                                !item.options.some((option: Data) => option.label === answer),
+                            )),
+                      )
                     )
-                      throw new Error('Kilo did not offer that permission choice');
+                      throw new Error('Answer Kilo with the offered choices');
                     await this.request(
                       host,
-                      `${path}/permission/${encodeURIComponent(approvalId)}/reply`,
+                      `${path}/question/${encodeURIComponent(question.id)}/reply`,
                       cwd,
-                      { reply: reply.choice },
+                      { answers: reply.answers },
                     );
-                  }
-                  this.changed();
-                })
+                  } else if (reply.choice === 'skip')
+                    await this.request(
+                      host,
+                      `${path}/question/${encodeURIComponent(question.id)}/reject`,
+                      cwd,
+                      {},
+                    );
+                  else throw new Error('Kilo did not offer that answer');
+                } else {
+                  if (
+                    !('choice' in reply) ||
+                    !approval.choices.some((choice) => choice.id === reply.choice)
+                  )
+                    throw new Error('Kilo did not offer that permission choice');
+                  await this.request(
+                    host,
+                    `${path}/permission/${encodeURIComponent(approvalId)}/reply`,
+                    cwd,
+                    { reply: reply.choice },
+                  );
+                }
+                this.changed();
+              }
             : undefined,
         };
       }),
@@ -428,88 +361,35 @@ export class Kilo {
   }
 
   // The native event stream invalidates snapshots; reconnecting re-reads the native state.
-  private listen(host: Endpoint): void {
-    if (this.stream || this.retry || this.stopped) return;
-    const controller = (this.stream = new AbortController());
-    void (async () => {
-      const response = await fetch(host.url + '/api/event', {
-        headers: { Authorization: host.authorization },
-        redirect: 'error',
-        signal: controller.signal,
-      });
-      if (!response.ok || !response.headers.get('content-type')?.includes('text/event-stream')) {
-        await response.body?.cancel();
-        throw new Error('Kilo events unavailable');
+  private async receive(host: Endpoint, stream: AbortController): Promise<void> {
+    for await (const data of frames(await subscribe(host, '/api/event', stream.signal))) {
+      const event = JSON.parse(data);
+      const item = event.data;
+      if (
+        event.type?.startsWith('session.next.text.') &&
+        typeof item?.sessionID === 'string' &&
+        typeof item.assistantMessageID === 'string' &&
+        typeof item.textID === 'string'
+      ) {
+        const id = `${item.assistantMessageID}:${item.textID}`;
+        const known = this.typing.get(item.sessionID);
+        if (this.typing.size < MAX_SESSIONS || known)
+          this.typing.set(item.sessionID, {
+            id,
+            text: clipped(
+              event.type === 'session.next.text.ended'
+                ? item.text
+                : (known?.id === id ? known.text : '') + clipped(item.delta),
+            ),
+          });
       }
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let data: string[] = [];
-      let size = 0;
-      for await (const chunk of bytes(response.body)) {
-        buffer += decoder.decode(chunk, { stream: true });
-        if (Buffer.byteLength(buffer) + size > MAX_BYTES)
-          throw new Error('Kilo event exceeds the local content limit');
-        let newline: number;
-        while ((newline = buffer.indexOf('\n')) >= 0) {
-          const line = buffer.slice(0, newline).replace(/\r$/, '');
-          buffer = buffer.slice(newline + 1);
-          if (line.startsWith('data:')) {
-            data.push(line.slice(5).trimStart());
-            size += Buffer.byteLength(line);
-          } else if (!line && data.length) {
-            const event = JSON.parse(data.join('\n'));
-            data = [];
-            size = 0;
-            const item = event.data;
-            if (
-              event.type?.startsWith('session.next.text.') &&
-              typeof item?.sessionID === 'string' &&
-              typeof item.assistantMessageID === 'string' &&
-              typeof item.textID === 'string'
-            ) {
-              const id = `${item.assistantMessageID}:${item.textID}`;
-              const known = this.typing.get(item.sessionID);
-              if (this.typing.size < MAX_SESSIONS || known)
-                this.typing.set(item.sessionID, {
-                  id,
-                  text: clipped(
-                    event.type === 'session.next.text.ended'
-                      ? item.text
-                      : (known?.id === id ? known.text : '') + clipped(item.delta),
-                  ),
-                });
-            }
-            if (!this.notify)
-              this.notify = setTimeout(() => {
-                this.notify = undefined;
-                this.changed();
-              }, EVENT_DELAY_MS);
-          }
-        }
-      }
-    })()
-      .catch(() => {})
-      .finally(() => {
-        if (this.stream === controller) {
-          this.stream = undefined;
-          this.typing.clear();
-        }
-        if (this.stopped || this.endpoint !== host) return;
-        this.retry = setTimeout(() => {
-          this.retry = undefined;
-          this.changed();
-          this.listen(host);
-        }, RECONNECT_MS);
-        this.retry.unref();
-      });
+      this.soon();
+    }
   }
 
   private close(): void {
-    this.stream?.abort();
-    this.stream = undefined;
-    clearTimeout(this.retry);
-    clearTimeout(this.notify);
-    this.retry = this.notify = undefined;
+    this.events?.close();
+    this.soon.cancel();
     this.typing.clear();
   }
 

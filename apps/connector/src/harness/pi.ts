@@ -4,8 +4,8 @@ import { readdir, readFile } from 'node:fs/promises';
 
 import type { Message } from '@dashup/protocol';
 
-import { EARLIER, toolInput, type LiveSession } from './session';
-import { PI_HOST, PI_VERSION, PI_MAX_TEXT, PI_MAX_FRAME, PI_REQUEST_MS, PI_MAX_HOSTS, PI_MAX_ENTRIES, PI_MAX_COMMAND, PI_MAX_REQUESTS, piFrame, piPrivate, piDirectory, type PiCommand, type PiSnapshot, type PiRegistry } from '../../pi/bridge';
+import { EARLIER, toolInput, liveDiscovery, type LiveSession } from './session';
+import { PI_HOST, PI_VERSION, PI_MAX_TEXT, PI_MAX_FRAME, PI_REQUEST_MS, PI_MAX_HOSTS, PI_MAX_ENTRIES, PI_MAX_COMMAND, piFrame, piPrivate, piDirectory, type PiCommand, type PiSnapshot, type PiRegistry } from '../../pi/bridge';
 
 // =============================================================================
 // Existing Pi extension endpoints
@@ -19,8 +19,7 @@ type Pending = {
 };
 
 async function entries(): Promise<Entry[]> {
-  if (process.env.DASHUP_LIVE_DISCOVERY === '0' && process.env.DASHUP_PI_DIRECTORY === undefined)
-    return [];
+  if (!liveDiscovery() && process.env.DASHUP_PI_DIRECTORY === undefined) return [];
   const directory = piDirectory();
   if (!(await piPrivate(directory, true))) return [];
   const files = (await readdir(directory).catch(() => []))
@@ -128,7 +127,6 @@ class Host {
   private connecting?: Promise<void>;
   private stopped = false;
   private readonly pending = new Map<string, Pending>();
-  private readonly requests = new Map<string, Promise<void>>();
 
   constructor(
     readonly entry: Entry,
@@ -242,8 +240,6 @@ class Host {
     text?: string,
     now?: boolean,
   ): Promise<void> {
-    const previous = this.requests.get(id);
-    if (previous) return previous;
     const socket = this.socket;
     if (
       this.stopped ||
@@ -253,7 +249,7 @@ class Host {
       this.snapshot.session !== session
     )
       return Promise.reject(new Error('Pi session is disconnected or changed'));
-    if (!id || id.length > 256 || this.requests.size >= PI_MAX_REQUESTS || this.pending.size >= 32)
+    if (!id || id.length > 256 || this.pending.size >= 32)
       return Promise.reject(new Error('Pi command limit reached'));
     if (
       method === 'send' &&
@@ -263,7 +259,7 @@ class Host {
         Buffer.byteLength(text) > PI_MAX_COMMAND)
     )
       return Promise.reject(new Error('Pi reply is unavailable; check Pi on your computer'));
-    const pending = new Promise<void>((resolve, reject) => {
+    return new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error('Pi did not acknowledge the command; delivery is unknown'));
@@ -280,22 +276,13 @@ class Host {
         }),
       );
     });
-    this.requests.set(id, pending);
-    return pending;
   }
 
-  async read(): Promise<LiveSession[]> {
+  async read(): Promise<LiveSession<'pi'>[]> {
     await this.connect();
     const value = this.snapshot;
     if (!value) return [];
     const session = value.session;
-    const messages = piMessages(value);
-    if (value.prompt)
-      messages.push({
-        id: `${session}:local-question`,
-        role: 'system',
-        text: `${String(value.prompt).slice(0, 256)}\nAnswer this extension question in Pi on your computer.`,
-      });
     return [
       {
         id: session,
@@ -304,7 +291,16 @@ class Host {
         ...(value.title ? { title: String(value.title).slice(0, 256) } : {}),
         updatedAt: value.updatedAt,
         status: value.prompt ? 'attention' : value.working ? 'working' : 'idle',
-        messages,
+        readMessages: async () => {
+          const messages = piMessages(value);
+          if (value.prompt)
+            messages.push({
+              id: `${session}:local-question`,
+              role: 'system',
+              text: `${String(value.prompt).slice(0, 256)}\nAnswer this extension question in Pi on your computer.`,
+            });
+          return { messages, more: false };
+        },
         approvals: [],
         ...(typeof value.typing === 'string' && value.typing
           ? { typing: value.typing.slice(0, PI_MAX_TEXT) }
@@ -334,11 +330,12 @@ class Host {
 }
 
 export class Pi {
+  readonly harness = 'pi';
   private stopped = false;
   private readonly hosts = new Map<string, Host>();
   constructor(private readonly changed: () => void) {}
 
-  async refresh(): Promise<LiveSession[]> {
+  async refresh(): Promise<LiveSession<'pi'>[]> {
     if (this.stopped) return [];
     const discovered = await entries();
     if (this.stopped) return [];

@@ -7,8 +7,9 @@ import { watch, existsSync, readdirSync, readFileSync, type FSWatcher } from 'no
 
 import type { Harness, Message, Remote, ProjectSummary, ThreadSummary, Capabilities } from '@dashup/protocol';
 
+import type { AcpSession } from './acp';
 import { scanHistories } from './harness/history';
-import { agentHarness, type LiveSession, type HistorySession } from './harness/session';
+import { agentHarness, type Page, type LiveSession, type HistorySession } from './harness/session';
 
 interface Location {
   editor   : 'zed' | 'vscode' | 'cli' | 'acp';
@@ -16,7 +17,19 @@ interface Location {
   session? : string;
   history? : HistorySession;
   live?    : LiveSession;
+  acp?     : AcpSession;
 }
+
+// What a thread's own records cannot say, asked of whoever knows: whether a native queue owner
+// takes the saved session's queued replies, whether a native process writes it, and whether its
+// agent starts here.
+export type Owners = {
+  queue(history: HistorySession)  : boolean;
+  writer(history: HistorySession) : boolean;
+  starts(harness: Harness)        : boolean;
+};
+
+const UNOWNED: Owners = { queue: () => false, writer: () => false, starts: () => false };
 
 // boundary: editor-owned persisted JSON changes independently of Dashup.
 type NativeRecord = Record<string, any>;
@@ -163,6 +176,7 @@ export class Discovery {
   constructor(
     readonly deviceId: string,
     readonly secret: string,
+    private readonly owners = UNOWNED,
   ) {}
 
   scan(): ProjectSummary[] {
@@ -210,7 +224,6 @@ export class Discovery {
   private history(session: HistorySession): void {
     const { thread } = this.native(session);
     this.locations.get(thread.id)!.history = session;
-    thread.capabilities = { ...thread.capabilities, read: true };
     thread.updatedAt = session.updatedAt;
     if (session.parent) thread.parent = agentThread(session.harness, session.parent, this.secret);
   }
@@ -238,25 +251,91 @@ export class Discovery {
     Object.assign(found.thread, {
       editor: session.editor ?? found.thread.editor,
       title: session.title ?? found.thread.title,
-      status: session.status,
       updatedAt: location.history?.updatedAt ?? session.updatedAt,
-      options: session.options?.(() => location.history?.settings?.() ?? {}),
-      // A project's snapshot holds every thread, so only a working one carries its step.
-      step: session.status === 'working' ? location.history?.step : undefined,
-      capabilities: {
-        ...found.thread.capabilities,
-        read: true,
-        send: Boolean(session.send),
-        stop: Boolean(session.stop),
-        now: Boolean(session.now),
-        approve: Boolean(session.approve),
-        configure: Boolean(session.configure),
-      },
     });
+    this.summarize(found.project, found.thread);
     return found;
   }
 
-  live(session: string, cwd: string): { project: ProjectSummary; thread: ThreadSummary } {
+  // Live sessions no integration lists any more, of one harness or of all, let go of what they hold.
+  retire(sessions: LiveSession[], harness?: Harness): void {
+    const current = new Set(sessions.map((session) => `${session.harness}:${session.id}`));
+    for (const [id, location] of this.locations) {
+      const live = location.live;
+      if (
+        !live ||
+        (harness && live.harness !== harness) ||
+        current.has(`${live.harness}:${live.id}`)
+      )
+        continue;
+      location.live = undefined;
+      live.releaseMessages?.();
+      for (const project of this.projects.values())
+        for (const thread of project.threads) if (thread.id === id) this.summarize(project, thread);
+    }
+  }
+
+  // An ACP session holds the editor thread it continues, or a thread of its own, until it closes.
+  adopt(agent: AcpSession, open = true): { project: ProjectSummary; thread: ThreadSummary } {
+    const found = this.acpThread(agent.id, agent.cwd);
+    this.locations.get(found.thread.id)!.acp = open ? agent : undefined;
+    found.thread.updatedAt = agent.updatedAt;
+    this.summarize(found.project, found.thread);
+    return found;
+  }
+
+  // Each thread no session holds shows what its saved records say, once they or their owners change.
+  refresh(): void {
+    for (const project of this.projects.values())
+      for (const thread of project.threads) {
+        const location = this.locations.get(thread.id);
+        if (location && !location.live && !location.acp) this.summarize(project, thread);
+      }
+  }
+
+  // A thread shows what holds it: an ACP or live session offers what either can do. Saved history
+  // alone reads, takes queued replies while a native queue has an owner, and continues headless when
+  // its agent starts here and no native process writes it; its lifecycle marker says what runs only
+  // while one does. Only a working thread carries its step: a project's snapshot holds every thread.
+  private summarize(project: ProjectSummary, thread: ThreadSummary): void {
+    const { editor, history, live, acp } = this.locations.get(thread.id)!;
+    const harness = thread.agent?.harness;
+    const queue   = !!history && this.owners.queue(history);
+    const writer  = !!history && this.owners.writer(history);
+    let saved: ThreadSummary['status'] | undefined;
+    if (history && writer && !live && !acp)
+      try {
+        saved = history.status?.();
+      } catch {
+        // A rollout can disappear between discovery and reading its lifecycle marker.
+      }
+    const resumes =
+      !!history &&
+      history.resumable !== false &&
+      !live &&
+      !project.remote &&
+      !queue &&
+      !writer &&
+      !!harness &&
+      this.owners.starts(harness);
+    thread.status = acp?.status ?? live?.status ?? saved ?? 'unknown';
+    thread.step = thread.status === 'working' ? history?.step : undefined;
+    thread.options = acp?.options ?? live?.options?.(() => history?.settings?.() ?? {});
+    thread.capabilities = {
+      read    : editor !== 'cli' || !!history || !!live,
+      send    : !!live?.send || !!acp || resumes,
+      queue,
+      stop    : !!live?.stop || !!acp,
+      approve : !!live?.approve || !!acp,
+      ...(live ? { now: !!live.now } : {}),
+      ...(live || acp ? { configure: !!live?.configure || !!acp?.options.length } : {}),
+    };
+  }
+
+  private acpThread(
+    session: string,
+    cwd: string,
+  ): { project: ProjectSummary; thread: ThreadSummary } {
     for (const project of this.projects.values()) {
       const thread = project.threads.find(
         (item) => this.locations.get(item.id)?.session === session,
@@ -423,12 +502,17 @@ export class Discovery {
     }
   }
 
-  read(thread: ThreadSummary, attached?: Message[]): Message[] {
+  // A conversation's newest page, or its page up to `before`, from whichever store holds it.
+  async read(thread: ThreadSummary, before?: string): Promise<Page> {
     const location = this.locations.get(thread.id);
     if (!location) throw new Error('Thread is no longer available');
-    if (location.history) return location.history.read();
-    if (location.live) return location.live.messages;
-    if (attached) return attached;
+    if (location.history) return { messages: location.history.read(before), more: false };
+    if (location.live) return location.live.readMessages?.(before) ?? { messages: [], more: false };
+    return { messages: location.acp?.messages ?? this.saved(location), more: false };
+  }
+
+  // A conversation only its editor's own files hold.
+  private saved(location: Location): Message[] {
     if (location.editor === 'vscode') {
       const state = chatSession(location.path);
       return (state.requests ?? [])

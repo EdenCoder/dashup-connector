@@ -7,18 +7,21 @@ import { statSync, existsSync, readdirSync, readFileSync, readlinkSync, realpath
 import type { QueueReceipt } from '@dashup/protocol';
 
 import { version as DASHUP_VERSION } from '../../package.json';
-import type { HistorySession } from './session';
 import { nativeProcesses } from './processes';
+import { liveDiscovery, type HistorySession } from './session';
 
 // =============================================================================
 // A queue writer is not a second conversation owner
 // =============================================================================
 
-const QUEUE_VERSIONS = new Set(['0.153.4', '0.160.1', '0.164.0', '0.165.0']);
-const REQUEST_MS    = 10_000;
-const MAX_BYTES     = 1024 * 1024;
-const MAX_FILES     = 4_096;
-const THREAD_ID     = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+// The first Codex release known to take thread/queue/add.
+const QUEUE_FROM   = [0, 153, 4];
+const QUEUE_FILE   = 'queue_1.sqlite';
+const HISTORY_FILE = 'thread_history_1.sqlite';
+const REQUEST_MS   = 10_000;
+const MAX_BYTES    = 1024 * 1024;
+const MAX_FILES    = 4_096;
+const THREAD_ID    = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 
 type FileIdentity = { path: string; device: number; inode: number };
 export type CodexOwner = {
@@ -124,9 +127,10 @@ function processOwners(pid: number): Owner[] {
       const owner: Owner = { writer };
       try {
         const version = codexVersion(executable);
-        if (!version || !QUEUE_VERSIONS.has(version)) return [owner];
-        const queue = identity(join(home, 'queue_1.sqlite'));
+        const queue = version ? queueDatabase(version, home) : undefined;
         if (
+          version &&
+          queue &&
           files.some((file) => {
             try {
               return sameFile(identity(join(root, 'fd', file.fd)), queue);
@@ -147,7 +151,7 @@ function processOwners(pid: number): Owner[] {
 }
 
 function owners(): Owner[] {
-  if (process.platform !== 'linux' || process.env.DASHUP_LIVE_DISCOVERY === '0') return [];
+  if (process.platform !== 'linux' || !liveDiscovery()) return [];
   try {
     return nativeProcesses('codex').flatMap((pid) => {
       try {
@@ -215,7 +219,7 @@ function validateEvidence(owner: QueueOwner): void {
     !sameFile(identity(owner.rollout.path), owner.rollout)
   )
     throw new Error('The original native history storage changed');
-  const path = join(owner.home, 'thread_history_1.sqlite');
+  const path = join(owner.home, HISTORY_FILE);
   if (existsSync(path) && identity(path).path !== path)
     throw new Error('Native history is outside the original home');
 }
@@ -224,43 +228,65 @@ function validateEvidence(owner: QueueOwner): void {
 // Native metadata proves identity; queue disappearance and message text do not
 // =============================================================================
 
+const QUEUED    = `SELECT id FROM queued_items WHERE thread_id = ?
+  AND json_extract(payload_json, '$.UserInput.client_id') = ? LIMIT 2`;
+const DELIVERED = `SELECT turn_id, rollout_ordinal FROM thread_items
+  WHERE thread_id = ? AND item_type = 'userMessage' AND json_extract(item_json, '$.type') = 'userMessage'
+  AND json_extract(item_json, '$.clientId') = ? LIMIT 2`;
+const RESPONDED = `SELECT item_id FROM thread_items WHERE thread_id = ?
+  AND turn_id = ? AND item_type = 'agentMessage' AND json_extract(item_json, '$.type') = 'agentMessage'
+  AND rollout_ordinal > ?
+  ORDER BY rollout_ordinal ASC LIMIT 1`;
+
+function prepares(path: string, statements: string[]): void {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    for (const statement of statements) database.prepare(statement);
+  } finally {
+    database.close();
+  }
+}
+
+// The queue database of a Codex home whose queue can be used: this release takes
+// thread/queue/add, and its queue and history databases answer the statements receipts are read
+// with. A release that changes either format has no queue here. Homes from before typed history
+// have no history database.
+export function queueDatabase(version: string, home: string): FileIdentity | undefined {
+  const release = version.split('.').map(Number);
+  const differs = QUEUE_FROM.findIndex((part, at) => release[at] !== part);
+  if (differs >= 0 && !(release[differs]! > QUEUE_FROM[differs]!)) return;
+  try {
+    const queue = identity(join(home, QUEUE_FILE));
+    prepares(queue.path, [QUEUED]);
+    const history = join(home, HISTORY_FILE);
+    if (existsSync(history)) prepares(identity(history).path, [DELIVERED, RESPONDED]);
+    return queue;
+  } catch {
+    return;
+  }
+}
+
 export function nativeReceipt(owner: QueueOwner, clientId: string): NativeReceipt {
   const queue = new DatabaseSync(owner.queue.path, { readOnly: true });
   let queueId: string | undefined;
   try {
-    const rows = queue
-      .prepare(
-        `SELECT id FROM queued_items WHERE thread_id = ?
-      AND json_extract(payload_json, '$.UserInput.client_id') = ? LIMIT 2`,
-      )
-      .all(owner.thread, clientId);
+    const rows = queue.prepare(QUEUED).all(owner.thread, clientId);
     if (rows.length > 1) throw new Error('Native input identity is ambiguous');
     if (typeof rows[0]?.id === 'string') queueId = rows[0].id;
   } finally {
     queue.close();
   }
-  const path = join(owner.home, 'thread_history_1.sqlite');
+  const path = join(owner.home, HISTORY_FILE);
   if (!existsSync(path)) return { queueId };
   const history = new DatabaseSync(path, { readOnly: true });
   try {
-    const rows = history
-      .prepare(
-        `SELECT turn_id, rollout_ordinal FROM thread_items
-      WHERE thread_id = ? AND item_type = 'userMessage' AND json_extract(item_json, '$.type') = 'userMessage'
-      AND json_extract(item_json, '$.clientId') = ? LIMIT 2`,
-      )
-      .all(owner.thread, clientId);
+    const rows = history.prepare(DELIVERED).all(owner.thread, clientId);
     if (rows.length > 1) throw new Error('Native input identity is ambiguous');
     const input = rows[0];
     if (!input || typeof input.turn_id !== 'string' || typeof input.rollout_ordinal !== 'number')
       return { queueId };
     const response = history
-      .prepare(
-        `SELECT item_id FROM thread_items WHERE thread_id = ?
-      AND turn_id = ? AND item_type = 'agentMessage' AND json_extract(item_json, '$.type') = 'agentMessage'
-      AND rollout_ordinal > ?
-      ORDER BY rollout_ordinal ASC LIMIT 1`,
-      )
+      .prepare(RESPONDED)
       .get(owner.thread, input.turn_id, input.rollout_ordinal);
     return {
       queueId,

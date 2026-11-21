@@ -1,9 +1,7 @@
 import Socket from 'ws';
 import { homedir } from 'node:os';
 import { connect } from 'node:net';
-import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { stat, readdir, readFile } from 'node:fs/promises';
 import { join, dirname, basename, isAbsolute } from 'node:path';
@@ -13,7 +11,8 @@ import { chatReducer, sessionReducer, SUPPORTED_PROTOCOL_VERSIONS, type Snapshot
 
 import type { Message, Approval } from '@dashup/protocol';
 
-import { NO_PREVIEW, MAX_PREVIEW, agentHarness, type LiveSession } from './session';
+import { privateAcl } from './local-file';
+import { debounced, NO_PREVIEW, MAX_PREVIEW, agentHarness, liveDiscovery, type LiveSession } from './session';
 
 // =============================================================================
 // Existing VS Code Agent Host endpoint registry
@@ -25,7 +24,6 @@ const MAX_METADATA = 64 * 1024;
 const MAX_HOSTS    = 16;
 const MAX_SESSIONS = 100;
 const ROOT_CHANNEL = 'ahp-root://';
-const run          = promisify(execFile);
 
 type Data = Record<string, any>;
 type Entry = { identity: string; path: string; token: string; root: string };
@@ -46,7 +44,7 @@ function roots(): string[] {
   const override = process.env.DASHUP_AHP_DATA ?? process.env.DASHUP_VSCODE_DATA;
   if (override !== undefined)
     return override ? [basename(override) === 'User' ? dirname(override) : override] : [];
-  if (process.env.DASHUP_LIVE_DISCOVERY === '0') return [];
+  if (!liveDiscovery()) return [];
   const base =
     process.platform === 'darwin'
       ? join(homedir(), 'Library/Application Support')
@@ -59,25 +57,7 @@ function roots(): string[] {
 async function privateFile(path: string, limit: number): Promise<boolean> {
   const file = await stat(path).catch(() => undefined);
   if (!file || file.size > limit) return false;
-  if (process.platform === 'win32') {
-    const encodedPath = Buffer.from(path).toString('base64');
-    const script = `$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedPath}')); $a=Get-Acl -LiteralPath $p -ErrorAction Stop; $sid=[Security.Principal.SecurityIdentifier]; $me=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $ok=$a.GetOwner($sid).Value -eq $me; foreach($r in $a.Access){if($r.AccessControlType -eq 'Allow' -and $r.IdentityReference.Translate($sid).Value -notin @($me,'S-1-5-18','S-1-5-32-544')){$ok=$false}}; $ok`;
-    try {
-      const { stdout } = await run(
-        'powershell.exe',
-        [
-          '-NoProfile',
-          '-NonInteractive',
-          '-EncodedCommand',
-          Buffer.from(script, 'utf16le').toString('base64'),
-        ],
-        { timeout: REQUEST_MS, maxBuffer: MAX_METADATA },
-      );
-      return stdout.trim().toLowerCase() === 'true';
-    } catch {
-      return false;
-    }
-  }
+  if (process.platform === 'win32') return privateAcl(path);
   return !process.getuid || (file.uid === process.getuid() && (file.mode & 0o077) === 0);
 }
 
@@ -279,9 +259,8 @@ class Host {
   private readonly resources = new Map<string, Resource>();
   private readonly subscriptions = new Set<string>();
   private readonly receipts = new Map<number, Receipt>();
-  private readonly requests = new Map<string, Promise<void>>();
   private active = new Set<string>();
-  private notify?: ReturnType<typeof setTimeout>;
+  private readonly soon = debounced(() => this.changed());
 
   constructor(
     readonly entry: Entry,
@@ -289,11 +268,7 @@ class Host {
   ) {}
 
   private changedSoon(): void {
-    if (!this.notify && !this.stopped)
-      this.notify = setTimeout(() => {
-        this.notify = undefined;
-        this.changed();
-      }, 100);
+    if (!this.stopped) this.soon();
   }
 
   private snapshot(snapshot: Snapshot): void {
@@ -433,15 +408,13 @@ class Host {
     return this.resources.get(uri)?.state;
   }
 
-  private dispatch(requestId: string, uri: string, action: StateAction): Promise<void> {
-    const prior = this.requests.get(requestId);
-    if (prior) return prior;
+  private dispatch(uri: string, action: StateAction): Promise<void> {
     const client = this.client;
     if (this.stopped || client?.connectionState.status !== 'connected' || !this.active.has(uri))
       return Promise.reject(new Error('Native AHP chat is disconnected'));
-    if (this.requests.size >= 1000 || this.receipts.size >= 32)
+    if (this.receipts.size >= 32)
       return Promise.reject(new Error('Native AHP command limit reached'));
-    const pending = new Promise<void>((resolve, reject) => {
+    return new Promise<void>((resolve, reject) => {
       const handle = client.dispatch(uri, action);
       const timer = setTimeout(() => {
         this.receipts.delete(handle.clientSeq);
@@ -449,8 +422,6 @@ class Host {
       }, REQUEST_MS);
       this.receipts.set(handle.clientSeq, { resolve, reject, timer });
     });
-    this.requests.set(requestId, pending);
-    return pending;
   }
 
   async read(): Promise<LiveSession[]> {
@@ -517,18 +488,16 @@ class Host {
                   : chat.status & 1
                     ? 'idle'
                     : 'unknown',
-            messages: messages(chat),
+            readMessages: async () => ({ messages: messages(chat), more: false }),
             approvals,
             // The host aborts the chat for any cancel, so only its current active turn is named.
             stop:
               chat.interactivity !== 'read-only'
-                ? (requestId) => {
-                    const prior = this.requests.get(requestId);
-                    if (prior) return prior;
+                ? () => {
                     const turn = this.resources.get(item.resource)?.state.activeTurn;
                     if (typeof turn?.id !== 'string')
                       return Promise.reject(new Error('Nothing is running in this VS Code chat'));
-                    return this.dispatch(requestId, item.resource, {
+                    return this.dispatch(item.resource, {
                       type: 'chat/turnCancelled',
                       turnId: turn.id,
                       duration: Math.max(0, Date.now() - Date.parse(turn.startedAt)) || 0,
@@ -538,8 +507,6 @@ class Host {
             send:
               chat.interactivity !== 'read-only' && (chat.status & 1) !== 0 && !(chat.status & 8)
                 ? (requestId, value) => {
-                    const prior = this.requests.get(requestId);
-                    if (prior) return prior;
                     const current = this.resources.get(item.resource)?.state;
                     if (
                       !value.trim() ||
@@ -551,7 +518,7 @@ class Host {
                       return Promise.reject(
                         new Error('Native AHP chat is unavailable for a reply'),
                       );
-                    return this.dispatch(requestId, item.resource, {
+                    return this.dispatch(item.resource, {
                       type: 'chat/turnStarted',
                       turnId: requestId,
                       startedAt: new Date().toISOString(),
@@ -560,10 +527,8 @@ class Host {
                   }
                 : undefined,
             approve: approvals.some((approval) => approval.choices.length)
-              ? (requestId, approvalId, reply) => {
+              ? (_requestId, approvalId, reply) => {
                   const choice = 'choice' in reply ? reply.choice : undefined;
-                  const prior = this.requests.get(requestId);
-                  if (prior) return prior;
                   const current = this.resources.get(summary.resource)?.state;
                   const pending = current?.inputNeeded?.find(
                     (entry: Data) =>
@@ -577,7 +542,7 @@ class Host {
                     : undefined;
                   if (!pending || !option)
                     return Promise.reject(new Error('Native approval is no longer pending'));
-                  return this.dispatch(requestId, item.resource, {
+                  return this.dispatch(item.resource, {
                     type: 'chat/toolCallConfirmed',
                     turnId: pending.turnId,
                     toolCallId: pending.toolCall.toolCallId,
@@ -600,7 +565,7 @@ class Host {
 
   stop(): void {
     this.stopped = true;
-    clearTimeout(this.notify);
+    this.soon.cancel();
     for (const receipt of this.receipts.values()) {
       clearTimeout(receipt.timer);
       receipt.reject(new Error('AHP observation stopped'));

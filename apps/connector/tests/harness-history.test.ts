@@ -8,6 +8,9 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renam
 
 import type { Message } from '@dashup/protocol';
 
+import { CHAT_PAGE_MESSAGES } from '@dashup/protocol/session';
+
+import { chatPage, chatPosition } from '../src/chat';
 import { planUsage } from '../src/usage';
 import { codexOptions } from '../src/harness/codex';
 import { scanHistories } from '../src/harness/history';
@@ -31,7 +34,7 @@ const TIME  = '2026-10-20T12:00:00.000Z';
 const at    = (seconds: number): string =>
   new Date(Date.parse(TIME) + seconds * 1000).toISOString();
 
-function fixture(run: (root: string, cwd: string) => void): void {
+async function fixture(run: (root: string, cwd: string) => void | Promise<void>): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), 'dashup-histories-'));
   const prior = HOMES.map((name) => process.env[name]);
   try {
@@ -44,7 +47,7 @@ function fixture(run: (root: string, cwd: string) => void): void {
     delete process.env.OPENCODE_DB;
     const cwd = join(root, 'project');
     mkdirSync(cwd);
-    run(root, cwd);
+    await run(root, cwd);
   } finally {
     HOMES.forEach((name, index) => {
       if (prior[index] === undefined) delete process.env[name];
@@ -285,6 +288,39 @@ test('reads only the selected Claude branch with original message and tool ident
     assert.equal(
       messages.some((message) => message.text === 'Abandoned branch'),
       false,
+    );
+  }));
+
+test('shows a message the person sent while Claude worked where Claude received it', () =>
+  fixture((root, cwd) => {
+    const path = join(root, 'claude/projects/project/claude-native.jsonl');
+    const queued = (uuid: string, parentUuid: string, kind: string, prompt: unknown) => ({
+      sessionId: 'claude-native',
+      cwd,
+      type: 'attachment',
+      uuid,
+      parentUuid,
+      timestamp: TIME,
+      attachment: { type: 'queued_command', prompt, commandMode: 'prompt', origin: { kind } },
+    });
+    lines(path, [
+      claudeRow(cwd, 'user', 'u1', null, 'Original request'),
+      claudeRow(cwd, 'assistant', 'a1', 'u1', [{ type: 'text', text: 'Working on it' }]),
+      queued('q1', 'a1', 'human', [{ type: 'text', text: 'Also check the input' }]),
+      queued('q2', 'q1', 'peer', '<cross-session-message>Not the person</cross-session-message>'),
+      claudeRow(cwd, 'assistant', 'a2', 'q2', [{ type: 'text', text: 'Checked both' }]),
+      queued('q3', 'a2', 'human', 'One more thing'),
+    ]);
+    const messages = scanHistories().sessions[0]!.read();
+    assert.deepEqual(
+      messages.map((message) => [message.id, message.role, message.text]),
+      [
+        ['u1', 'user', 'Original request'],
+        ['a1', 'assistant', 'Working on it'],
+        ['q1', 'user', 'Also check the input'],
+        ['a2', 'assistant', 'Checked both'],
+        ['q3', 'user', 'One more thing'],
+      ],
     );
   }));
 
@@ -534,7 +570,7 @@ test('reads legacy OpenCode JSON stores and isolates unrelated corrupt or unknow
 // =============================================================================
 
 test('native history and live observations reuse the existing Zed thread', () =>
-  fixture((root, cwd) => {
+  fixture(async (root, cwd) => {
     zed(root, cwd, [{ agent: 'claude-code', session: 'claude-native' }]);
     lines(join(root, 'claude/projects/project/claude-native.jsonl'), [
       claudeRow(cwd, 'user', 'native-message', null, 'Existing CLI history behind Zed'),
@@ -551,7 +587,7 @@ test('native history and live observations reuse the existing Zed thread', () =>
     assert.equal(thread.capabilities.send, false);
     assert.equal(thread.capabilities.approve, false);
     assert.deepEqual(
-      discovery.read(thread).map((message) => message.text),
+      (await discovery.read(thread)).messages.map((message) => message.text),
       ['Existing CLI history behind Zed'],
     );
     const live: LiveSession = {
@@ -561,9 +597,12 @@ test('native history and live observations reuse the existing Zed thread', () =>
       title: 'Same running native session',
       updatedAt: TIME,
       status: 'attention',
-      messages: [
-        { id: 'native-live-message', role: 'assistant', text: 'Awaiting native approval' },
-      ],
+      readMessages: async () => ({
+        messages: [
+          { id: 'native-live-message', role: 'assistant', text: 'Awaiting native approval' },
+        ],
+        more: false,
+      }),
       approvals: [
         {
           id: 'native-permission',
@@ -583,7 +622,7 @@ test('native history and live observations reuse the existing Zed thread', () =>
     assert.equal(thread.capabilities.send, true);
     assert.equal(thread.capabilities.approve, true);
     assert.deepEqual(
-      discovery.read(thread, live.messages).map((message) => message.text),
+      (await discovery.read(thread)).messages.map((message) => message.text),
       ['Existing CLI history behind Zed'],
     );
     discovery.observe({ ...live, send: undefined, approve: undefined });
@@ -592,7 +631,7 @@ test('native history and live observations reuse the existing Zed thread', () =>
   }));
 
 test('a matching path alone never merges local native history into an unrelated SSH editor thread', () =>
-  fixture((root, cwd) => {
+  fixture(async (root, cwd) => {
     zed(root, cwd, [{ agent: 'zed', session: 'unrelated-zed-session' }], true);
     lines(join(root, 'claude/projects/project/claude-native.jsonl'), [
       claudeRow(cwd, 'user', 'native-message', null, 'Local native history'),
@@ -608,7 +647,7 @@ test('a matching path alone never merges local native history into an unrelated 
     assert.equal(remote.threads[0]!.agent, undefined);
     assert.deepEqual(local.threads[0]!.agent, { harness: 'claude', sessionId: 'claude-native' });
     assert.deepEqual(
-      discovery.read(local.threads[0]!).map((message) => message.text),
+      (await discovery.read(local.threads[0]!)).messages.map((message) => message.text),
       ['Local native history'],
     );
   }));
@@ -717,7 +756,6 @@ test('editor threads take their conversation time, so a Zed sidebar restamp publ
       harness   : 'claude',
       updatedAt : '2026-10-26T03:07:25.028Z',
       status    : 'idle',
-      messages  : [],
       approvals : [],
     });
     assert.equal(live.thread.updatedAt, at(-86_400));
@@ -728,7 +766,7 @@ test('editor threads take their conversation time, so a Zed sidebar restamp publ
 // =============================================================================
 
 test('OpenCode child sessions and Codex spawned agents name their parent thread', () =>
-  fixture((root, cwd) => {
+  fixture(async (root, cwd) => {
     const db = database(join(root, 'data/opencode/opencode.db'), cwd);
     db.prepare('INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, NULL)').run(
       'ses_child',
@@ -783,7 +821,9 @@ test('OpenCode child sessions and Codex spawned agents name their parent thread'
     assert.equal(thread('codex', 'codex-child').parent, thread('codex', 'codex-parent').id);
     assert.equal(threads.filter((item) => item.parent).length, 2);
     assert.deepEqual(
-      discovery.read(thread('claude', 'claude-native')).map((message) => message.text),
+      (await discovery.read(thread('claude', 'claude-native'))).messages.map(
+        (message) => message.text,
+      ),
       ['Delegate the review'],
     );
   }));
@@ -835,7 +875,6 @@ test('a running Claude session shows the model its newest reply ran on, its spee
       harness   : 'claude',
       updatedAt : TIME,
       status    : 'idle',
-      messages  : [],
       approvals : [],
       options   : (recorded) => [{ id: 'model', name: 'Model', value: String(recorded().model) }],
       configure : async () => {},
@@ -912,8 +951,7 @@ test('a working session names the step it took last, and an idle one names none'
     const discovery = discover();
     discovery.scan();
     const step = (harness: 'claude' | 'codex', id: string, status: LiveSession['status']) =>
-      discovery.observe({ id, cwd, harness, status, updatedAt: TIME, messages: [], approvals: [] })
-        .thread.step;
+      discovery.observe({ id, cwd, harness, status, updatedAt: TIME, approvals: [] }).thread.step;
     assert.deepEqual(step('claude', 'claude-native', 'working'), {
       name    : 'Read',
       summary : '/work/handler.ts',
@@ -1544,6 +1582,151 @@ test('OpenCode tool parts keep their recorded diff, failure and duration', () =>
           tool : { name: 'grep', summary: 'retry', at: '2026-10-20T12:00:00.000Z' },
         },
       ]);
+    } finally {
+      db.close();
+    }
+  }));
+
+// =============================================================================
+// Conversation windows
+// =============================================================================
+
+// What reading every message and part, as OpenCode's history did before it read in windows, gives
+// for a conversation whose messages hold text parts and parts that show nothing.
+function everyOpenCodeMessage(db: DatabaseSync): Message[] {
+  const parse = (value: unknown) => {
+    try {
+      return JSON.parse(String(value));
+    } catch {
+      return undefined;
+    }
+  };
+  const parts = db
+    .prepare('SELECT id, message_id, data FROM part WHERE session_id = ? ORDER BY time_created, id')
+    .all('ses_native') as Record<string, any>[];
+  return (
+    db
+      .prepare('SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created, id')
+      .all('ses_native') as Record<string, any>[]
+  ).flatMap((message) => {
+    const role = parse(message.data)?.role;
+    if (role !== 'user' && role !== 'assistant') return [];
+    return parts
+      .filter((part) => part.message_id === message.id)
+      .flatMap((part): Message[] => {
+        const data = parse(part.data);
+        return data?.type === 'text' && typeof data.text === 'string'
+          ? [{ id: part.id, role, text: data.text }]
+          : [];
+      });
+  });
+}
+
+test('an OpenCode window gives the pages reading every message gave, newest and before every cursor', () =>
+  fixture((root, cwd) => {
+    const db = database(join(root, 'data/opencode/opencode.db'), cwd);
+    try {
+      // Messages three to a timestamp, their ids in that order only within it, written shuffled.
+      const rows = Array.from({ length: 100 }, (_, place) => ({
+        id     : `msg_${'abc'[place % 3]}_${String(99 - place).padStart(3, '0')}`,
+        time   : Date.parse(TIME) + Math.floor(place / 3) * 1000,
+        place,
+      }));
+      const role = (place: number) =>
+        place === 0 || place === 50 ? 'system' : place % 2 ? 'assistant' : 'user';
+      for (let index = 0; index < rows.length; index++) {
+        const row = rows[(index * 37) % rows.length]!;
+        db.prepare('INSERT INTO message VALUES (?, ?, ?, ?)').run(
+          row.id,
+          'ses_native',
+          row.time,
+          row.place === 1 ? '{' : JSON.stringify({ role: role(row.place) }),
+        );
+      }
+      // Parts are stamped before their message, two to a stamp, so neither their ids nor the order
+      // they were written in gives their order.
+      const parts: [string, string, string, number, string][] = [];
+      for (const row of rows) {
+        if (row.place === 2) continue;
+        const words = (part: number) =>
+          row.place % 10 === 7 && part === 0
+            ? `${row.place} `.repeat(1_500)
+            : `${role(row.place)} ${row.place}.${part}`;
+        // From the middle on, each message shows exactly one part.
+        const kinds =
+          row.place >= 51 && row.place <= 53
+            ? ['reasoning', 'step-start']
+            : row.place % 2 && row.place < 50
+              ? ['text', 'step-start', 'text', 'reasoning']
+              : row.place % 2
+                ? ['step-start', 'text']
+                : ['text'];
+        kinds.forEach((type, part) =>
+          parts.push([
+            `prt_${row.id}_${3 - part}`,
+            row.id,
+            'ses_native',
+            row.time - 5_000 + (part >> 1) * 10,
+            JSON.stringify(type === 'text' ? { type, text: words(part) } : { type }),
+          ]));
+      }
+      parts.push(['prt_unreadable', rows[9]!.id, 'ses_native', rows[9]!.time, '{']);
+      parts.push([
+        'prt_elsewhere',
+        rows[9]!.id,
+        'ses_other',
+        rows[9]!.time,
+        JSON.stringify({ type: 'text', text: 'Another session' }),
+      ]);
+      for (let index = 0; index < parts.length; index++)
+        db.prepare('INSERT INTO part VALUES (?, ?, ?, ?, ?)').run(
+          ...parts[(index * 53) % parts.length]!,
+        );
+
+      const every = everyOpenCodeMessage(db);
+      const session = scanHistories().sessions.find((item) => item.harness === 'opencode')!;
+      const key = '07'.repeat(32);
+      const target = { project: 'project', thread: 'thread', updatedAt: TIME };
+      const cursor = (message: Message) =>
+        chatPage(key, target, [message], undefined, undefined, '', true).before!;
+      // A window is the conversation's own run of messages, ending with its anchor's message.
+      const slice = (window: Message[]) => {
+        const start = every.findIndex((message) => message.id === window[0]!.id);
+        assert.deepEqual(window, every.slice(start, start + window.length));
+      };
+      assert.ok(every.length > 3 * CHAT_PAGE_MESSAGES);
+
+      const newest = session.read();
+      slice(newest);
+      assert.equal(newest.at(-1)!.id, every.at(-1)!.id);
+      assert.ok(newest.length < every.length);
+      assert.deepEqual(chatPage(key, target, newest), chatPage(key, target, every));
+
+      for (const message of every) {
+        const window = session.read(message.id);
+        slice(window);
+        assert.deepEqual(
+          chatPage(key, target, window, cursor(message)),
+          chatPage(key, target, every, cursor(message)),
+        );
+      }
+      assert.ok(session.read(every[CHAT_PAGE_MESSAGES * 2]!.id).length < every.length);
+
+      // The pages a phone loads one after another, back to the conversation's start.
+      let page = chatPage(key, target, every);
+      let loaded = 0;
+      while (page.before) {
+        const before = page.before;
+        page = chatPage(key, target, session.read(chatPosition(key, target, before)), before);
+        assert.deepEqual(page, chatPage(key, target, every, before));
+        loaded++;
+      }
+      assert.ok(loaded > 2);
+
+      const missing = cursor({ id: 'prt_missing', role: 'user', text: '' });
+      assert.deepEqual(session.read('prt_missing'), []);
+      for (const messages of [every, session.read('prt_missing')])
+        assert.throws(() => chatPage(key, target, messages, missing), /conversation changed/);
     } finally {
       db.close();
     }

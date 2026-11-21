@@ -3,7 +3,5 @@
   "compilerOptions": {
     "strictPropertyInitialization": false
   },
-  "include": [
-    "src"
-  ]
+  "include": ["src"]
 }

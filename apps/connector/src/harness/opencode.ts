@@ -8,46 +8,39 @@ import { stat, readlink, readdir, readFile } from 'node:fs/promises';
 
 import type { Approval, AgentOption } from '@dashup/protocol';
 
-import { nativeProcesses } from './processes';
-
-import { NO_PREVIEW, MAX_PREVIEW, questionApproval, type Settings, type LiveSession } from './session';
+import { commandRuns, nativeProcesses } from './processes';
+import { debounced, NO_PREVIEW, MAX_PREVIEW, liveDiscovery, questionApproval, type Settings, type LiveSession } from './session';
+import { frames, request, subscribe, MAX_BYTES, REQUEST_MS, EventStream, loopbackOrigin, type Endpoint } from './local-http';
 
 // =============================================================================
 // Existing local OpenCode servers
 // =============================================================================
 
-const run                = promisify(execFile);
-const REQUEST_MS         = 4_000;
-const MAX_BYTES          = 8 * 1024 * 1024;
-const MAX_SESSIONS       = 100;
-const MAX_ENDPOINTS      = 32;
-const EVENT_DELAY_MS     = 100;
-const RECONNECT_MS       = 2_000;
-const PERMISSION_CHOICES = [
+const run           = promisify(execFile);
+const MAX_SESSIONS  = 100;
+const MAX_ENDPOINTS = 32;
+const ANSWER_MS     = 15_000;
+const SERVER        = {
+  name   : 'OpenCode',
+  asked  : 'OpenCode native request',
+  folder : 'x-opencode-directory',
+};
+
+// What OpenCode, its service and Kilo each offer for a permission.
+export const PERMISSION_CHOICES = [
   { id: 'once', label: 'Allow once' },
   { id: 'always', label: 'Always allow' },
   { id: 'reject', label: 'Reject' },
 ];
 
-type Data     = Record<string, any>;
-type Endpoint = { url: string; authorization?: string };
+type Data = Record<string, any>;
 
-export function localEndpoint(value: string): string {
-  const url = new URL(value);
-  if (
-    url.protocol !== 'http:' ||
-    !['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname) ||
-    url.username ||
-    url.password ||
-    url.search ||
-    url.hash ||
-    url.pathname !== '/'
-  )
-    throw new Error('OpenCode endpoint must be an uncredentialed loopback HTTP origin');
-  // A numeric loopback address prevents hostname resolution from leaving this computer.
-  if (url.hostname === 'localhost') url.hostname = '127.0.0.1';
-  return url.origin;
-}
+// The id a request's message carries: the same request names the same message.
+export const messageId = (requestId: string): string =>
+  `msg_${createHash('sha256').update(requestId).digest('hex').slice(0, 32)}`;
+
+export const localEndpoint = (value: string): string =>
+  loopbackOrigin(value, 'OpenCode endpoint must be an uncredentialed loopback HTTP origin');
 
 function authorization(environment: Record<string, string | undefined>): string | undefined {
   const password = environment.OPENCODE_SERVER_PASSWORD;
@@ -122,7 +115,7 @@ async function endpoints(): Promise<Endpoint[]> {
         }
       });
   }
-  if (process.env.DASHUP_LIVE_DISCOVERY === '0') return [];
+  if (!liveDiscovery()) return [];
   if (process.platform === 'linux') return linuxEndpoints();
   if (process.platform === 'darwin') {
     const { stdout } = await run(
@@ -163,25 +156,6 @@ async function endpoints(): Promise<Endpoint[]> {
       }));
   }
   return [];
-}
-
-async function body(response: Response): Promise<string> {
-  const reader = response.body?.getReader();
-  if (!reader) return '';
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  try {
-    for (;;) {
-      const value = await reader.read();
-      if (value.done) break;
-      size += value.value.byteLength;
-      if (size > MAX_BYTES) throw new Error('OpenCode response exceeds the local content limit');
-      chunks.push(value.value);
-    }
-    return Buffer.concat(chunks).toString('utf8');
-  } finally {
-    await reader.cancel().catch(() => {});
-  }
 }
 
 function permissionApproval(permission: Data, history: unknown, cwd: string): Approval {
@@ -339,7 +313,7 @@ export function sessionOptions(models: unknown, agents: unknown, session?: Data)
 }
 
 // What a saved session last ran with: its model as `provider/model`, and its agent.
-export function openCodeOptions(recorded: Settings): AgentOption[] {
+function openCodeOptions(recorded: Settings): AgentOption[] {
   const model = typeof recorded.model === 'string' ? recorded.model : '';
   const split = model.indexOf('/');
   if (split < 0) return [];
@@ -349,74 +323,67 @@ export function openCodeOptions(recorded: Settings): AgentOption[] {
   });
 }
 
+type Catalog = [models: unknown, agents: unknown];
+
+// The models and agents OpenCode lists for each folder, asked once while it answers.
+export class Catalogs {
+  private readonly known = new Map<string, Promise<Catalog>>();
+
+  constructor(private readonly request: (path: string, directory: string) => Promise<any>) {}
+
+  of(cwd: string): Promise<Catalog> {
+    let listed = this.known.get(cwd);
+    if (!listed) {
+      listed = Promise.all([
+        this.request('/api/model', cwd).then((found) => found?.data),
+        this.request('/api/agent', cwd).then((found) => found?.data),
+      ]).catch(() => {
+        this.known.delete(cwd);
+        return [[], []] as Catalog;
+      });
+      this.known.set(cwd, listed);
+    }
+    return listed;
+  }
+
+  clear(): void {
+    this.known.clear();
+  }
+}
+
+// What OpenCode takes to keep a model, as `provider/model`, or an agent on a session.
+export function sessionChoice(option: string, value: string | boolean): Data {
+  const chosen = String(value);
+  const split  = chosen.indexOf('/');
+  return option === 'model'
+    ? { model: { providerID: chosen.slice(0, split), id: chosen.slice(split + 1) } }
+    : { agent: chosen };
+}
+
 // =============================================================================
 // One existing server and its native event stream
 // =============================================================================
 
 class Server {
-  private stream?: AbortController;
-  private retry?: ReturnType<typeof setTimeout>;
-  private notify?: ReturnType<typeof setTimeout>;
   private stopped = false;
-  private readonly requests = new Map<string, Promise<void>>();
-  // The models and agents OpenCode lists for each folder, asked once while it answers.
-  private readonly catalogs = new Map<string, Promise<[unknown, unknown]>>();
+  private readonly soon = debounced(() => this.changed());
+  // Whether the event stream is open, once it has tried.
+  private listening: Promise<boolean> = Promise.resolve(false);
+  private readonly events = new EventStream(
+    (stream) => this.receive(stream),
+    () => this.changed(),
+  );
+  private readonly catalogs = new Catalogs((path, directory) => this.request(path, directory));
+  // Prompts OpenCode has not begun answering, by session.
+  private readonly answering = new Map<string, (error?: Error) => void>();
 
   constructor(
     readonly endpoint: Endpoint,
     private readonly changed: () => void,
   ) {}
 
-  private headers(directory?: string): Record<string, string> {
-    return {
-      ...(this.endpoint.authorization ? { Authorization: this.endpoint.authorization } : {}),
-      ...(directory ? { 'x-opencode-directory': directory } : {}),
-    };
-  }
-
-  private async request(path: string, directory?: string, payload?: Data): Promise<any> {
-    const signal = AbortSignal.timeout(REQUEST_MS);
-    const response = await fetch(this.endpoint.url + path, {
-      method: payload === undefined ? 'GET' : 'POST',
-      headers: {
-        ...this.headers(directory),
-        ...(payload ? { 'Content-Type': 'application/json' } : {}),
-      },
-      ...(payload === undefined ? {} : { body: JSON.stringify(payload) }),
-      redirect: 'error',
-      signal,
-    });
-    if (!response.ok) {
-      await response.body?.cancel();
-      throw new Error(`OpenCode native request failed (${response.status})`);
-    }
-    const text = await body(response);
-    return text ? JSON.parse(text) : undefined;
-  }
-
-  private once(id: string, action: () => Promise<void>): Promise<void> {
-    const known = this.requests.get(id);
-    if (known) return known;
-    if (this.requests.size >= 1000)
-      throw new Error('OpenCode command history is full; reconnect before sending');
-    const pending = action();
-    this.requests.set(id, pending);
-    return pending;
-  }
-
-  private catalog(cwd: string): Promise<[unknown, unknown]> {
-    let known = this.catalogs.get(cwd);
-    if (!known) {
-      known = Promise.all([
-        this.request('/api/model', cwd).then((listed) => listed?.data),
-        this.request('/api/agent', cwd).then((listed) => listed?.data),
-      ]).catch(() => {
-        this.catalogs.delete(cwd);
-        return [[], []] as [unknown, unknown];
-      });
-      this.catalogs.set(cwd, known);
-    }
-    return known;
+  private request(path: string, directory?: string, payload?: Data): Promise<any> {
+    return request(this.endpoint, SERVER, path, directory, payload);
   }
 
   // A message to one of this folder's sessions, in the agent and model it runs with; a new
@@ -426,11 +393,35 @@ class Server {
       this.request(`/session/${encodeURIComponent(id)}/message?limit=200`, cwd),
       this.request(`/api/session/${encodeURIComponent(id)}`, cwd).catch(() => undefined),
     ]);
-    await this.request(`/session/${encodeURIComponent(id)}/prompt_async`, cwd, {
+    await this.ask(id, cwd, {
       ...promptContext(existing, session?.data),
       parts: [{ type: 'text', text }],
     });
+  }
+
+  // Resolves once OpenCode begins answering, or rejects with why it can't: OpenCode reports a
+  // refused prompt, such as one for a model it doesn't have, only as an event.
+  private async ask(id: string, cwd: string, prompt: Data): Promise<void> {
+    const answered = (await this.listen())
+      ? new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => settle(), ANSWER_MS);
+          const settle = (error?: Error) => {
+            clearTimeout(timer);
+            this.answering.delete(id);
+            if (error) reject(error);
+            else resolve();
+          };
+          this.answering.set(id, settle);
+        })
+      : undefined;
+    try {
+      await this.request(`/session/${encodeURIComponent(id)}/prompt_async`, cwd, prompt);
+    } catch (error) {
+      this.answering.get(id)?.();
+      throw error;
+    }
     this.changed();
+    await answered;
   }
 
   async start(cwd: string, text: string): Promise<string> {
@@ -440,13 +431,13 @@ class Server {
     return id;
   }
 
-  async read(): Promise<LiveSession[]> {
+  async read(): Promise<LiveSession<'opencode'>[]> {
     const health = await this.request('/global/health');
     if (health?.healthy !== true || typeof health.version !== 'string') return [];
     this.listen();
     const sessions = await this.request(`/session?limit=${MAX_SESSIONS}`);
     if (!Array.isArray(sessions)) return [];
-    const result: LiveSession[] = [];
+    const result: LiveSession<'opencode'>[] = [];
     const states = new Map<string, Promise<[Data, Data[], Data[], Data[], [unknown, unknown]]>>();
     for (const session of sessions.slice(0, MAX_SESSIONS) as Data[]) {
       if (
@@ -468,7 +459,7 @@ class Server {
               (listed) => (Array.isArray(listed?.data) ? listed.data : []),
               () => [],
             ),
-            this.catalog(cwd),
+            this.catalogs.of(cwd),
           ]);
           states.set(cwd, state);
         }
@@ -515,103 +506,92 @@ class Server {
                   (!status[id] || status[id].type === 'idle')
                 ? 'idle'
                 : 'unknown',
-          messages: [],
           approvals,
-          stop: (requestId) =>
-            this.once(requestId, async () => {
-              if (this.stopped) throw new Error('OpenCode is disconnected');
-              // Abort answers true even for an idle session, so the native status decides.
-              const current = await this.request('/session/status', cwd);
-              if (!['busy', 'retry'].includes(current?.[id]?.type))
-                throw new Error('Nothing is running in this OpenCode session');
-              await this.request(`/session/${encodeURIComponent(id)}/abort`, cwd, {});
-              this.changed();
-            }),
-          send: (requestId, text) =>
-            this.once(requestId, async () => {
-              if (this.stopped) throw new Error('OpenCode is disconnected');
-              if (!text.trim() || Buffer.byteLength(text) > MAX_BYTES / 2)
-                throw new Error('Message is empty or too large');
-              const messageID = `msg_${createHash('sha256').update(requestId).digest('hex').slice(0, 32)}`;
-              const existing = await this.request(
-                `/session/${encodeURIComponent(id)}/message?limit=200`,
-                cwd,
-              );
-              if (
-                Array.isArray(existing) &&
-                existing.some((entry: Data) => entry?.info?.id === messageID)
-              )
-                return;
-              await this.request(`/session/${encodeURIComponent(id)}/prompt_async`, cwd, {
-                ...promptContext(existing, current),
-                messageID,
-                parts: [{ type: 'text', text }],
-              });
-              this.changed();
-            }),
+          stop: async () => {
+            if (this.stopped) throw new Error('OpenCode is disconnected');
+            // Abort answers true even for an idle session, so the native status decides.
+            const current = await this.request('/session/status', cwd);
+            if (!['busy', 'retry'].includes(current?.[id]?.type))
+              throw new Error('Nothing is running in this OpenCode session');
+            await this.request(`/session/${encodeURIComponent(id)}/abort`, cwd, {});
+            this.changed();
+          },
+          send: async (requestId, text) => {
+            if (this.stopped) throw new Error('OpenCode is disconnected');
+            if (!text.trim() || Buffer.byteLength(text) > MAX_BYTES / 2)
+              throw new Error('Message is empty or too large');
+            const messageID = messageId(requestId);
+            const existing = await this.request(
+              `/session/${encodeURIComponent(id)}/message?limit=200`,
+              cwd,
+            );
+            if (
+              Array.isArray(existing) &&
+              existing.some((entry: Data) => entry?.info?.id === messageID)
+            )
+              return;
+            await this.ask(id, cwd, {
+              ...promptContext(existing, current),
+              messageID,
+              parts: [{ type: 'text', text }],
+            });
+          },
           options: () => sessionOptions(models, agents, current),
-          // OpenCode keeps the model, as `provider/model`, and the agent on the session.
-          configure: (requestId, option, value) =>
-            this.once(requestId, async () => {
-              if (this.stopped) throw new Error('OpenCode is disconnected');
-              const chosen = String(value);
-              const split  = chosen.indexOf('/');
-              await this.request(
-                `/api/session/${encodeURIComponent(id)}/${option}`,
-                cwd,
-                option === 'model'
-                  ? { model: { providerID: chosen.slice(0, split), id: chosen.slice(split + 1) } }
-                  : { agent: chosen },
-              );
-              this.changed();
-            }),
+          configure: async (_requestId, option, value) => {
+            if (this.stopped) throw new Error('OpenCode is disconnected');
+            await this.request(
+              `/api/session/${encodeURIComponent(id)}/${option}`,
+              cwd,
+              sessionChoice(option, value),
+            );
+            this.changed();
+          },
           approve: approvals.some((approval) => approval.choices.length)
-            ? (requestId, approvalId, reply) =>
-                this.once(requestId, async () => {
-                  if (this.stopped) throw new Error('OpenCode is disconnected');
-                  const choice = 'choice' in reply ? reply.choice : undefined;
-                  if (approvalId.startsWith('question:')) {
-                    const requestID = approvalId.slice('question:'.length);
-                    const current = await this.request('/question', cwd);
+            ? async (_requestId, approvalId, reply) => {
+                if (this.stopped) throw new Error('OpenCode is disconnected');
+                const choice = 'choice' in reply ? reply.choice : undefined;
+                if (approvalId.startsWith('question:')) {
+                  const requestID = approvalId.slice('question:'.length);
+                  const current = await this.request('/question', cwd);
+                  if (
+                    !Array.isArray(current) ||
+                    !current.some(
+                      (value: Data) => value?.id === requestID && value.sessionID === id,
+                    )
+                  )
+                    throw new Error('Question is no longer pending');
+                  await this.request(
+                    `/question/${encodeURIComponent(requestID)}/${'answers' in reply ? 'reply' : 'reject'}`,
+                    cwd,
+                    'answers' in reply ? { answers: reply.answers } : {},
+                  );
+                } else {
+                  const current = await this.request('/permission', cwd);
+                  const permission = Array.isArray(current)
+                    ? current.find(
+                        (value: Data) => value?.id === approvalId && value.sessionID === id,
+                      )
+                    : undefined;
+                  if (!PERMISSION_CHOICES.some((value) => value.id === choice) || !permission)
+                    throw new Error('Permission is no longer pending or choice is unavailable');
+                  if (choice !== 'reject') {
+                    const history = await this.request(
+                      `/session/${encodeURIComponent(id)}/message?limit=200`,
+                      cwd,
+                    );
                     if (
-                      !Array.isArray(current) ||
-                      !current.some(
-                        (value: Data) => value?.id === requestID && value.sessionID === id,
+                      !permissionApproval(permission, history, cwd).choices.some(
+                        (value) => value.id === choice,
                       )
                     )
-                      throw new Error('Question is no longer pending');
-                    await this.request(
-                      `/question/${encodeURIComponent(requestID)}/${'answers' in reply ? 'reply' : 'reject'}`,
-                      cwd,
-                      'answers' in reply ? { answers: reply.answers } : {},
-                    );
-                  } else {
-                    const current = await this.request('/permission', cwd);
-                    const permission = Array.isArray(current)
-                      ? current.find(
-                          (value: Data) => value?.id === approvalId && value.sessionID === id,
-                        )
-                      : undefined;
-                    if (!PERMISSION_CHOICES.some((value) => value.id === choice) || !permission)
-                      throw new Error('Permission is no longer pending or choice is unavailable');
-                    if (choice !== 'reject') {
-                      const history = await this.request(
-                        `/session/${encodeURIComponent(id)}/message?limit=200`,
-                        cwd,
-                      );
-                      if (
-                        !permissionApproval(permission, history, cwd).choices.some(
-                          (value) => value.id === choice,
-                        )
-                      )
-                        throw new Error(NO_PREVIEW);
-                    }
-                    await this.request(`/permission/${encodeURIComponent(approvalId)}/reply`, cwd, {
-                      reply: choice,
-                    });
+                      throw new Error(NO_PREVIEW);
                   }
-                  this.changed();
-                })
+                  await this.request(`/permission/${encodeURIComponent(approvalId)}/reply`, cwd, {
+                    reply: choice,
+                  });
+                }
+                this.changed();
+              }
             : undefined,
         });
       } catch {
@@ -621,81 +601,52 @@ class Server {
     return result;
   }
 
-  private listen(): void {
-    if (this.stream || this.retry || this.stopped) return;
-    const controller = (this.stream = new AbortController());
-    const connectTimer = setTimeout(() => controller.abort(), REQUEST_MS);
-    connectTimer.unref();
-    void (async () => {
-      const response = await fetch(this.endpoint.url + '/global/event', {
-        headers: this.headers(),
-        redirect: 'error',
-        signal: controller.signal,
-      });
-      clearTimeout(connectTimer);
-      if (!response.ok || !response.headers.get('content-type')?.includes('text/event-stream'))
-        throw new Error('OpenCode events unavailable');
-      const reader = response.body?.getReader();
-      if (!reader) return;
-      const decoder = new TextDecoder();
-      let pending = '';
-      try {
-        for (;;) {
-          const next = await reader.read();
-          if (next.done) break;
-          pending += decoder.decode(next.value, { stream: true });
-          if (Buffer.byteLength(pending) > MAX_BYTES)
-            throw new Error('OpenCode event exceeds the local content limit');
-          let boundary: number;
-          while ((boundary = pending.search(/\r?\n\r?\n/)) >= 0) {
-            const frame = pending.slice(0, boundary);
-            pending = pending.slice(boundary).replace(/^\r?\n\r?\n/, '');
-            const data = frame
-              .split(/\r?\n/)
-              .filter((line) => line.startsWith('data:'))
-              .map((line) => line.slice(5).trimStart())
-              .join('\n');
-            if (!data) continue;
-            let event: Data;
-            try {
-              event = JSON.parse(data);
-            } catch {
-              continue;
-            }
-            const type = event.payload?.type ?? event.type;
-            if (typeof type !== 'string' || !/^(session|message|permission|question)\./.test(type))
-              continue;
-            if (!this.notify)
-              this.notify = setTimeout(() => {
-                this.notify = undefined;
-                this.changed();
-              }, EVENT_DELAY_MS);
-          }
+  private listen(): Promise<boolean> {
+    this.events.open();
+    return this.listening;
+  }
+
+  // One connection's events, which must open within a request's time.
+  private async receive(stream: AbortController): Promise<void> {
+    const connecting = setTimeout(() => stream.abort(), REQUEST_MS);
+    connecting.unref();
+    let opened!: (open: boolean) => void;
+    this.listening = new Promise((resolve) => (opened = resolve));
+    try {
+      const body = await subscribe(this.endpoint, '/global/event', stream.signal);
+      clearTimeout(connecting);
+      if (!body) return;
+      opened(true);
+      for await (const data of frames(body)) {
+        let event: Data;
+        try {
+          event = JSON.parse(data);
+        } catch {
+          continue;
         }
-      } finally {
-        await reader.cancel().catch(() => {});
+        const type = event.payload?.type ?? event.type;
+        if (typeof type !== 'string' || !/^(session|message|permission|question)\./.test(type))
+          continue;
+        const properties = (event.payload ?? event).properties;
+        const settle     = this.answering.get(properties?.sessionID);
+        if (settle && type === 'session.error') {
+          const reason = properties.error?.data?.message ?? properties.error?.name;
+          settle(new Error(String(reason ?? 'OpenCode could not answer').slice(0, 500)));
+        } else if (settle && type === 'message.updated' && properties.info?.role === 'assistant')
+          settle();
+        this.soon();
       }
-    })()
-      .catch(() => {})
-      .finally(() => {
-        clearTimeout(connectTimer);
-        if (this.stream === controller) this.stream = undefined;
-        if (!this.stopped) {
-          this.changed();
-          this.retry = setTimeout(() => {
-            this.retry = undefined;
-            this.listen();
-          }, RECONNECT_MS);
-          this.retry.unref();
-        }
-      });
+    } finally {
+      clearTimeout(connecting);
+      opened(false);
+      this.listening = Promise.resolve(false);
+    }
   }
 
   stop(): void {
     this.stopped = true;
-    this.stream?.abort();
-    clearTimeout(this.retry);
-    clearTimeout(this.notify);
+    this.events.close();
+    this.soon.cancel();
   }
 }
 
@@ -724,19 +675,30 @@ function serve(cwd: string): { process: ChildProcess; endpoint: Promise<Endpoint
 }
 
 export class OpenCode {
+  readonly harness = 'opencode';
+  readonly recorded = openCodeOptions;
   private readonly servers = new Map<string, Server>();
   // Servers this connector started, by folder.
   private readonly started = new Map<string, ReturnType<typeof serve>>();
   constructor(private readonly changed: () => void) {}
 
-  // The server this connector runs for a folder, started when first needed.
+  available(): Promise<boolean> {
+    return commandRuns('opencode');
+  }
+
+  // The server this connector runs for a folder, started when first needed and again once it has
+  // stopped.
   private async served(cwd: string): Promise<Server> {
     let served = this.started.get(cwd);
-    if (!served) this.started.set(cwd, (served = serve(cwd)));
-    const endpoint = await served.endpoint.catch((error: unknown) => {
-      this.started.delete(cwd);
-      throw error;
-    });
+    if (!served) {
+      const next = (served = serve(cwd));
+      this.started.set(cwd, next);
+      for (const end of ['exit', 'error'])
+        next.process.once(end, () => {
+          if (this.started.get(cwd) === next) this.started.delete(cwd);
+        });
+    }
+    const endpoint = await served.endpoint;
     let server = this.servers.get(endpoint.url);
     if (!server) {
       server = new Server(endpoint, this.changed);
@@ -753,7 +715,7 @@ export class OpenCode {
     await (await this.served(cwd)).prompt(id, cwd, text);
   }
 
-  async refresh(): Promise<LiveSession[]> {
+  async refresh(): Promise<LiveSession<'opencode'>[]> {
     const discovered = await endpoints().catch(() => []);
     const current = new Map(discovered.map((endpoint) => [endpoint.url, endpoint]));
     for (const served of this.started.values()) {

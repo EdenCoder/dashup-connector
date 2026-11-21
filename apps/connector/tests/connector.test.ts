@@ -20,7 +20,7 @@ import { bridgeAcp, commandAcp, type AcpSession } from '../src/acp';
 import type { LiveSession } from '../src/harness/session';
 import type { CodexOwner, NativeQueue } from '../src/harness/queue';
 
-test('saved native threads retain their SSH owner and actual persisted conversation without granting live control, and SSH agent threads stay with their host', () => {
+test('saved native threads retain their SSH owner and actual persisted conversation without granting live control, and SSH agent threads stay with their host', async () => {
   const root = mkdtempSync(join(tmpdir(), 'dashup-editors-'));
   const zed = join(root, 'zed');
   const code = join(root, 'code');
@@ -154,12 +154,12 @@ test('saved native threads retain their SSH owner and actual persisted conversat
     // Zed's own agent stamps the thread content; the sidebar's `updated_at` is bookkeeping.
     assert.equal(remote.threads[0]!.updatedAt, '2026-10-16T22:15:00.500Z');
     assert.deepEqual(
-      discovery.read(remote.threads[0]!).map((message) => message.text),
+      (await discovery.read(remote.threads[0]!)).messages.map((message) => message.text),
       ['Fix retries', 'The retry key changes.'],
     );
     const local = projects.find((project) => !project.remote)!;
     assert.deepEqual(
-      discovery.read(local.threads[0]!).map((message) => message.text),
+      (await discovery.read(local.threads[0]!)).messages.map((message) => message.text),
       ['Fix the UI', 'Updated the form.'],
     );
     assert.equal(replaySession(lines + '{"kind":').requests[0].message.text, 'Fix the UI');
@@ -198,7 +198,6 @@ test('a native history resume opt-out stays read-only despite an installed agent
   try {
     const internal = connector as unknown as {
       startable: ['junie'];
-      refreshResumes(): void;
       command(
         pair: PairingRecord,
         command: Extract<Content, { type: 'command' }>,
@@ -239,7 +238,7 @@ test('a native history resume opt-out stays read-only despite an installed agent
     connector.harnesses.resume = async () => {
       resumes++;
     };
-    internal.refreshResumes();
+    connector.discovery.refresh();
     assert.equal(thread.capabilities.send, false);
     // A stale advertised capability cannot override the current native ownership record.
     thread.capabilities.send = true;
@@ -344,7 +343,6 @@ test('a saved Claude thread takes replies from the moment its agent is found, th
         harness   : 'claude',
         updatedAt : '2026-11-03T00:00:00.000Z',
         status    : 'idle',
-        messages  : [],
         approvals : [],
         send      : async () => {},
       },
@@ -391,7 +389,6 @@ test('Codex lifecycle status requires its writer, preserves live observations, a
       startable: ['codex'];
       nativeQueue: NativeQueue;
       refreshQueues(): void;
-      refreshResumes(): void;
       command(
         pair: PairingRecord,
         command: Extract<Content, { type: 'command' }>,
@@ -453,7 +450,6 @@ test('Codex lifecycle status requires its writer, preserves live observations, a
     assert.equal(reads, 0);
     internal.nativeQueue.writers = [owner];
     internal.refreshQueues();
-    internal.refreshResumes();
     assert.equal(thread.status, 'working');
     assert.deepEqual(thread.step, step);
     assert.equal(thread.capabilities.queue, false);
@@ -469,7 +465,6 @@ test('Codex lifecycle status requires its writer, preserves live observations, a
       harness: 'codex',
       status: 'attention',
       updatedAt: thread.updatedAt,
-      messages: [],
       approvals: [],
     };
     thread.status = 'attention';
@@ -489,19 +484,26 @@ test('Codex lifecycle status requires its writer, preserves live observations, a
       resumes++;
     };
     thread.capabilities.send = true;
-    await assert.rejects(
+    const send = (requestId: string) =>
       internal.command(
         { id: 'pair', device: 'computer', mobile: 'phone', code: '', revokedAt: null },
         {
           type: 'command',
-          requestId: 'stale-send',
+          requestId,
           projectId: 'project',
           threadId: thread.id,
           action: { kind: 'thread.send', text: 'Continue the original thread' },
         },
-      ),
-      /session is open on your computer/,
-    );
+      );
+    // Queueing is offered only where the installed Codex takes a queued reply.
+    await assert.rejects(send('stale-send'), {
+      message: 'This Codex session is open on your computer. Continue it there.',
+    });
+    internal.nativeQueue.owners = [{ ...owner, version: '0.165.0', queue: owner.rollout }];
+    await assert.rejects(send('queued-send'), {
+      message: 'This Codex session is open on your computer. Queue a reply or continue it there.',
+    });
+    internal.nativeQueue.owners = [];
     assert.equal(resumes, 0);
     location.history!.status = () => {
       throw new Error('Rollout disappeared');
@@ -559,7 +561,6 @@ test('an approval stays the ask Home shows until it is answered, however the tra
       harness: 'claude',
       status: 'attention',
       updatedAt: thread.updatedAt,
-      messages: [],
       approvals: [approval],
     };
     connector.discovery.locations.set(thread.id, { editor: 'cli', path: root, live });
@@ -774,4 +775,75 @@ test('ACP settings track native changes and configuration results without adding
   assert.equal(sessions.get('native')!.options[0]!.value, 'default');
   assert.deepEqual(sessions.get('native')!.messages, []);
   socket.destroy();
+});
+
+test('a conversation a phone reads is let go only when no phone reads it, however often it is listed afresh', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dashup-follow-'));
+  const previous = process.env.DASHUP_CONFIG;
+  process.env.DASHUP_CONFIG = join(root, 'connector.json');
+  const pair: PairingRecord = {
+    id        : 'pair',
+    device    : 'computer',
+    mobile    : 'phone',
+    code      : '',
+    revokedAt : null,
+  };
+  const connector = new Connector({
+    api         : 'http://127.0.0.1:1',
+    secret      : 'fixture',
+    localSecret : 'fixture-secret',
+    device      : {
+      id       : 'computer',
+      user     : 'owner',
+      name     : 'Computer',
+      kind     : 'desktop',
+      platform : 'linux',
+    },
+    pairs       : { pair: { key: newSecret(randomBytes), sequence: 0 } },
+  });
+  const internal = connector as unknown as {
+    selected: Map<string, object>;
+    sendPage(pair: PairingRecord, selected: object): Promise<void>;
+    removeSelected(key: string): void;
+  };
+  let released = 0;
+  // A hosted session lists itself afresh on every refresh.
+  const listing = (): LiveSession => ({
+    id           : 'hosted',
+    cwd          : root,
+    harness      : 'claude',
+    updatedAt    : '2026-11-18T00:00:00.000Z',
+    status       : 'working',
+    approvals    : [],
+    readMessages : async () => ({ messages: [], more: false }),
+    releaseMessages: () => {
+      released++;
+    },
+  });
+  try {
+    const { project, thread } = connector.discovery.observe(listing());
+    const followed = (pairing: string) => ({
+      pairing,
+      project : project.id,
+      thread  : thread.id,
+      latest  : true,
+      live    : connector.discovery.locations.get(thread.id)!.live,
+    });
+    const first = followed('pair');
+    const second = followed('another-phone');
+    internal.selected.set('first', first);
+    internal.selected.set('second', second);
+    connector.discovery.observe(listing());
+    await internal.sendPage(pair, first);
+    assert.equal(released, 0);
+    internal.removeSelected('first');
+    assert.equal(released, 0);
+    internal.removeSelected('second');
+    assert.equal(released, 1);
+  } finally {
+    connector.stop();
+    if (previous === undefined) delete process.env.DASHUP_CONFIG;
+    else process.env.DASHUP_CONFIG = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
 });

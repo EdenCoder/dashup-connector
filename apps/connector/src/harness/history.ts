@@ -5,6 +5,7 @@ import { join, dirname, resolve, isAbsolute } from 'node:path';
 import { closeSync, existsSync, openSync, readSync, realpathSync, readdirSync, statSync } from 'node:fs';
 
 import { HISTORY_TOOL_CHARS } from '@dashup/protocol';
+import { CHAT_PAGE_MESSAGES } from '@dashup/protocol/session';
 import type { Message, ToolStep } from '@dashup/protocol';
 import { contextUsage, type ContextUsage } from '@dashup/protocol/context';
 
@@ -462,6 +463,16 @@ const claudeOutput = (row: NativeRecord): string | undefined =>
     ? text(row.content).replace(OUTPUT_TAGS, '').trim()
     : undefined;
 
+// A message the person sends while Claude works is recorded only as a queued command.
+function claudeQueued(row: NativeRecord): unknown {
+  const queued = row.type === 'attachment' ? object(row.attachment) : undefined;
+  return queued?.type === 'queued_command' &&
+    queued.commandMode === 'prompt' &&
+    object(queued.origin)?.kind === 'human'
+    ? (queued.prompt ?? '')
+    : undefined;
+}
+
 function claudeCommand(value: string): string | undefined {
   const name = /<command-name>([^<]*)<\/command-name>/.exec(value)?.[1];
   const args = /<command-args>([^<]*)<\/command-args>/.exec(value)?.[1] ?? '';
@@ -493,7 +504,12 @@ function claudeMessages(path: string): Message[] {
   for (const row of rows) {
     if (typeof row.uuid === 'string' && !row.isSidechain) {
       chain.set(row.uuid, row);
-      if (row.type === 'user' || row.type === 'assistant' || claudeOutput(row) !== undefined)
+      if (
+        row.type === 'user' ||
+        row.type === 'assistant' ||
+        claudeOutput(row) !== undefined ||
+        claudeQueued(row) !== undefined
+      )
         leaf = row.uuid;
     }
     if (typeof row.leafUuid === 'string' && chain.has(row.leafUuid)) leaf = row.leafUuid;
@@ -524,6 +540,8 @@ function claudeConversation(conversation: NativeRecord[], rows: NativeRecord[]):
     const output  = claudeOutput(row);
     const command = row.type === 'user' ? claudeCommand(text(content)) : undefined;
     if (output !== undefined) return prose(id, 'system', output);
+    const queued  = claudeQueued(row);
+    if (queued !== undefined) return prose(id, 'user', queued);
     if ((row.type !== 'user' && row.type !== 'assistant') || row.isMeta) return [];
     if (command !== undefined) return [{ id, role: 'user', text: command }];
     return [
@@ -977,6 +995,9 @@ function kimi(root: string, scan: Scan): void {
 // OpenCode
 // =============================================================================
 
+// Messages are read back this many at a time.
+const PAGE_ROWS = CHAT_PAGE_MESSAGES + 1;
+
 // OpenCode keeps an applied edit's unified diff; a write marks a new file `exists: false`.
 function openCodeChange(state: NativeRecord): string | undefined {
   const metadata = object(state.metadata);
@@ -1026,35 +1047,67 @@ function openDatabase(path: string): DatabaseSync {
   return db;
 }
 
-function databaseMessages(path: string, session: string): Message[] {
+// A conversation is read back from its newest message, or from the one holding `before`, until it
+// holds more than a phone's page before that anchor: the first message the phone shows then has an
+// earlier one whenever the conversation does. Each message is read with its parts, in their order.
+function databaseMessages(path: string, session: string, before?: string): Message[] {
   const db = openDatabase(path);
   try {
     db.exec('BEGIN');
-    const messages = db
-      .prepare('SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created, id')
-      .all(session) as NativeRecord[];
-    const parts = db
-      .prepare(
-        'SELECT id, message_id, data FROM part WHERE session_id = ? ORDER BY time_created, id',
-      )
-      .all(session) as NativeRecord[];
-    const grouped = new Map<string, NativeRecord[]>();
-    for (const part of parts) {
-      const data = parse(String(part.data));
-      if (!data) continue;
-      const group = grouped.get(part.message_id) ?? [];
-      group.push({ ...data, id: part.id });
-      grouped.set(part.message_id, group);
+    const order = (
+      db
+        .prepare('SELECT id FROM message WHERE session_id = ? ORDER BY time_created, id')
+        .all(session) as NativeRecord[]
+    ).map((row) => row.id);
+    const anchor =
+      before === undefined
+        ? undefined
+        : (db
+            .prepare('SELECT message_id FROM part WHERE id = ? AND session_id = ?')
+            .get(before, session) as NativeRecord | undefined);
+    let start = before === undefined ? order.length : order.indexOf(anchor?.message_id) + 1;
+    const messages: Message[] = [];
+    while (start > 0) {
+      const ids = order.slice(Math.max(0, start - PAGE_ROWS), start);
+      messages.unshift(...databaseRows(db, session, ids));
+      start -= ids.length;
+      const shown =
+        before === undefined
+          ? messages.length
+          : messages.findIndex((message) => message.id === before);
+      if (shown < 0 || shown > CHAT_PAGE_MESSAGES) break;
     }
-    return messages.flatMap((message) => {
-      const data = parse(String(message.data));
-      return data && ['user', 'assistant'].includes(data.role)
-        ? openCodeParts(message.id, data.role, grouped.get(message.id) ?? [])
-        : [];
-    });
+    return messages;
   } finally {
     db.close();
   }
+}
+
+function databaseRows(db: DatabaseSync, session: string, ids: string[]): Message[] {
+  const list = ids.map(() => '?').join(', ');
+  const messages = new Map(
+    (
+      db.prepare(`SELECT id, data FROM message WHERE id IN (${list})`).all(...ids) as NativeRecord[]
+    ).map((message) => [message.id, message]),
+  );
+  const grouped = new Map<string, NativeRecord[]>();
+  for (const part of db
+    .prepare(
+      `SELECT id, message_id, data FROM part WHERE session_id = ? AND message_id IN (${list}) ORDER BY time_created, id`,
+    )
+    .all(session, ...ids) as NativeRecord[]) {
+    const data = parse(String(part.data));
+    if (!data) continue;
+    const group = grouped.get(part.message_id) ?? [];
+    group.push({ ...data, id: part.id });
+    grouped.set(part.message_id, group);
+  }
+  return ids.flatMap((id) => {
+    const data = parse(String(messages.get(id)?.data));
+    return data && ['user', 'assistant'].includes(data.role)
+      ? openCodeParts(id, data.role, grouped.get(id) ?? [])
+      : [];
+  });
 }
 
 // A session runs on the model and agent of its last message from the person.
@@ -1208,7 +1261,7 @@ function openCodeDatabase(path: string, scan: Scan): void {
         parent    : typeof row.parent_id === 'string' ? row.parent_id : undefined,
         updatedAt : date(row.updated, modified),
         files     : [path, `${path}-wal`, `${path}-shm`],
-        read      : () => databaseMessages(path, row.id),
+        read      : (before) => databaseMessages(path, row.id, before),
         settings  : () => databaseSettings(path, row.id),
       });
     }

@@ -11,7 +11,7 @@ import type { ClientConnection, InitializeResponse, SessionNotification, Request
 import type { Message, Approval, ApprovalReply } from '@dashup/protocol';
 
 import { version as DASHUP_VERSION } from '../../package.json';
-import { EARLIER, toolInput, NO_PREVIEW, MAX_PREVIEW, type LiveSession } from './session';
+import { EARLIER, firstLine, toolInput, NO_PREVIEW, MAX_PREVIEW, type LiveSession } from './session';
 import { junieHome } from './junie-history';
 
 // =============================================================================
@@ -21,7 +21,6 @@ import { junieHome } from './junie-history';
 const REQUEST_MS   = 30_000;
 const MAX_BYTES    = 8 * 1024 * 1024;
 const MAX_MESSAGES = 1_000;
-const MAX_REQUESTS = 1_000;
 
 type Data = Record<string, any>;
 type Permission = {
@@ -345,7 +344,7 @@ class Session {
     await within(accepted, () => this.end());
   }
 
-  live(once: (id: string, action: () => Promise<void>) => Promise<void>): LiveSession {
+  live(): LiveSession<'junie'> {
     const connected = !this.ended && !!this.connection;
     return {
       id        : this.id,
@@ -354,44 +353,44 @@ class Session {
       harness   : 'junie',
       updatedAt : this.updatedAt,
       status    : this.permissions.size ? 'attention' : this.turn ? 'working' : 'idle',
-      messages  : this.messages.map((message) => ({ ...message })),
+      readMessages : async () => ({
+        messages : this.messages.map((message) => ({ ...message })),
+        more     : false,
+      }),
       approvals : [...this.permissions.values()].map((permission) => permission.approval),
       ...(connected
         ? {
-            send: (id: string, prompt: string, now?: boolean) =>
-              once(id, () => this.say(prompt, now)),
+            send: (_id: string, prompt: string, now?: boolean) => this.say(prompt, now),
             ...(this.turn
               ? {
-                  stop: (id: string) =>
-                    once(id, async () => {
-                      if (!this.turn || !this.connection || this.ended)
-                        throw new Error('Nothing is running in this Junie session');
-                      const turn = this.turn;
-                      await this.connection.agent.notify(methods.agent.session.cancel, {
-                        sessionId: this.id,
-                      });
-                      for (const permission of this.permissions.values())
-                        permission.resolve({ outcome: { outcome: 'cancelled' } });
-                      await within(turn, () => this.end());
-                    }),
+                  stop: async () => {
+                    if (!this.turn || !this.connection || this.ended)
+                      throw new Error('Nothing is running in this Junie session');
+                    const turn = this.turn;
+                    await this.connection.agent.notify(methods.agent.session.cancel, {
+                      sessionId: this.id,
+                    });
+                    for (const permission of this.permissions.values())
+                      permission.resolve({ outcome: { outcome: 'cancelled' } });
+                    await within(turn, () => this.end());
+                  },
                 }
               : {}),
             ...(this.permissions.size
               ? {
-                  approve: (id: string, approvalId: string, reply: ApprovalReply) =>
-                    once(id, async () => {
-                      const permission = this.permissions.get(approvalId);
-                      if (!permission || this.ended)
-                        throw new Error('Junie approval is no longer pending');
-                      if (
-                        !('choice' in reply) ||
-                        !permission.approval.choices.some((choice) => choice.id === reply.choice)
-                      )
-                        throw new Error('Choose one of the native Junie permission options');
-                      permission.resolve({
-                        outcome: { outcome: 'selected', optionId: reply.choice },
-                      });
-                    }),
+                  approve: async (_id: string, approvalId: string, reply: ApprovalReply) => {
+                    const permission = this.permissions.get(approvalId);
+                    if (!permission || this.ended)
+                      throw new Error('Junie approval is no longer pending');
+                    if (
+                      !('choice' in reply) ||
+                      !permission.approval.choices.some((choice) => choice.id === reply.choice)
+                    )
+                      throw new Error('Choose one of the native Junie permission options');
+                    permission.resolve({
+                      outcome: { outcome: 'selected', optionId: reply.choice },
+                    });
+                  },
                 }
               : {}),
           }
@@ -420,9 +419,9 @@ class Session {
 // =============================================================================
 
 export class Junie {
+  readonly harness = 'junie';
   private readonly owned = new Set<Session>();
   private readonly sessions = new Map<string, Session>();
-  private readonly requests = new Map<string, Promise<void>>();
   private stopped = false;
 
   constructor(private readonly changed: () => void) {}
@@ -430,16 +429,6 @@ export class Junie {
   available(): Promise<boolean> {
     return junieCommand().then(Boolean);
   }
-
-  private readonly once = (id: string, action: () => Promise<void>): Promise<void> => {
-    const known = this.requests.get(id);
-    if (known) return known;
-    if (this.requests.size >= MAX_REQUESTS)
-      throw new Error('Junie command history is full; restart Dashup before sending');
-    const result = Promise.resolve().then(action);
-    this.requests.set(id, result);
-    return result;
-  };
 
   async start(cwd: string, prompt: string): Promise<string> {
     if (this.stopped) throw new Error('Dashup has stopped its Junie connections');
@@ -451,7 +440,7 @@ export class Junie {
     try {
       await session.open(command, false);
       if (this.stopped) throw new Error('Dashup has stopped its Junie connections');
-      session.title = prompt.trim().split('\n')[0]!.slice(0, 80);
+      session.title = firstLine(prompt);
       this.sessions.set(session.id, session);
       await session.say(prompt);
       return session.id;
@@ -491,10 +480,8 @@ export class Junie {
     }
   }
 
-  async refresh(): Promise<LiveSession[]> {
-    return this.stopped
-      ? []
-      : [...this.sessions.values()].map((session) => session.live(this.once));
+  async refresh(): Promise<LiveSession<'junie'>[]> {
+    return this.stopped ? [] : [...this.sessions.values()].map((session) => session.live());
   }
 
   stop(): void {

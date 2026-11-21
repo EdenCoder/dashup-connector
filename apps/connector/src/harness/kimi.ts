@@ -1,26 +1,23 @@
 import { join } from 'node:path';
 import { once } from 'node:events';
-import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
-import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 
-import type { Approval, Message, AgentOption, ThreadSummary } from '@dashup/protocol';
+import type { Approval, AgentOption, ThreadSummary } from '@dashup/protocol';
 
 import { zedData } from '../discovery';
 import { kimiHome } from './history';
+import { commandRuns } from './processes';
 import { version as DASHUP_VERSION } from '../../package.json';
-import { MAX_PREVIEW, questionApproval, type Settings, type LiveSession } from './session';
+import { hand, debounced, firstLine, MAX_PREVIEW, questionApproval, HostedConversation, type Settings, type LiveSession } from './session';
 
 // =============================================================================
 // The Kimi command, its models and its switches
 // =============================================================================
 
-const run          = promisify(execFile);
-const MAX_REQUESTS = 1_000;
-const NOTIFY_MS    = 100;
-const CHOICES      = [
+const CHOICES = [
   { id: 'approve', label: 'Allow once' },
   { id: 'approve_for_session', label: 'Allow for this session' },
   { id: 'reject', label: 'Reject', text: true as const },
@@ -31,24 +28,43 @@ type Model   = { value: string; name: string; thinking: boolean };
 type Pending = { rpc: unknown; request: unknown; approval: Approval; questions?: Data[] };
 
 // `kimi` where it is installed, else the newest copy Zed's agent registry keeps.
-export async function kimiCommand(): Promise<string | undefined> {
-  const shell = process.platform === 'win32';
-  if (
-    await run('kimi', ['--version'], { timeout: 10_000, shell }).then(
-      () => true,
-      () => false,
-    )
-  )
-    return 'kimi';
+async function kimiCommand(): Promise<string | undefined> {
+  if (await commandRuns('kimi')) return 'kimi';
   const registry = join(zedData(), 'external_agents/registry/kimi');
   return (existsSync(registry) ? readdirSync(registry) : [])
-    .map((version) => join(registry, version, shell ? 'kimi.exe' : 'kimi'))
+    .map((version) => join(registry, version, process.platform === 'win32' ? 'kimi.exe' : 'kimi'))
     .filter((path) => existsSync(path))
     .sort((left, right) => statSync(right).mtimeMs - statSync(left).mtimeMs)[0];
 }
 
+// A token of a config line: a basic string, a literal string, a comment, which ends the line, or
+// any other character.
+const TOKEN = /"(?:[^"\\]|\\.)*"|'[^']*'|#.*|\S/g;
+
+// A config line as its shape, without spaces and with each string a `\0`, and what its strings
+// say. A basic string with an escape JSON does not share says nothing.
+function line(text: string): { shape: string; strings: (string | undefined)[] } {
+  let shape = '';
+  const strings: (string | undefined)[] = [];
+  for (const [token] of text.matchAll(TOKEN)) {
+    if (token[0] === '#') break;
+    if (token.length === 1) {
+      shape += token;
+      continue;
+    }
+    shape += '\0';
+    try {
+      strings.push(token[0] === "'" ? token.slice(1, -1) : (JSON.parse(token) as string));
+    } catch {
+      strings.push(undefined);
+    }
+  }
+  return { shape, strings };
+}
+
 // The models Kimi's config names, with whether each thinks, and the defaults a session starts
-// with. Kimi writes the file itself: quoted model sections, then `key = value` lines.
+// with. Kimi writes the file itself, as quoted model sections and `key = value` lines, and a person
+// may edit it: a value in any form but the one its key takes is absent.
 function config(): { model?: string; thinking?: boolean; models: Model[] } {
   let text = '';
   try {
@@ -59,27 +75,33 @@ function config(): { model?: string; thinking?: boolean; models: Model[] } {
   const found: ReturnType<typeof config> = { models: [] };
   let section = '';
   let model: Model | undefined;
-  for (const line of text.split('\n')) {
-    const header = /^\s*\[(.+)\]\s*$/.exec(line)?.[1];
+  for (const raw of text.split('\n')) {
+    const { shape, strings } = line(raw);
+    const [first] = strings;
+    const header = /^\[(.+)\]$/.exec(shape)?.[1];
     if (header !== undefined) {
       section = header;
-      const named = /^models\."(.+)"$/.exec(header)?.[1];
-      model = named ? { value: named, name: named, thinking: false } : undefined;
+      model =
+        header === 'models.\0' && first !== undefined
+          ? { value: first, name: first, thinking: false }
+          : undefined;
       if (model) found.models.push(model);
       continue;
     }
-    const [, key, value = ''] = /^\s*(\w+)\s*=\s*(.+?)\s*$/.exec(line) ?? [];
-    if (model && key === 'display_name') model.name = JSON.parse(value);
-    else if (model && key === 'capabilities') model.thinking = value.includes('"thinking"');
-    else if (!section && key === 'default_model') found.model = JSON.parse(value);
-    else if (!section && key === 'default_thinking') found.thinking = value === 'true';
+    const [, key, value = ''] = /^(\w+)=(.+)$/.exec(shape) ?? [];
+    if (model && key === 'display_name' && value === '\0') model.name = first ?? model.name;
+    else if (model && key === 'capabilities' && /^\[(?:\0(?:,\0)*,?)?\]$/.test(value))
+      model.thinking = strings.includes('thinking');
+    else if (!section && key === 'default_model' && value === '\0') found.model = first;
+    else if (!section && key === 'default_thinking' && /^(?:true|false)$/.test(value))
+      found.thinking = value === 'true';
   }
   return found;
 }
 
 // What a Kimi session runs with: the model and thinking it starts with, among the models Kimi's
 // config names, and its plan mode. A saved session records only its plan mode.
-export function kimiOptions(recorded: Settings): AgentOption[] {
+function kimiOptions(recorded: Settings): AgentOption[] {
   const { models } = config();
   const model   = typeof recorded.model === 'string' ? recorded.model : undefined;
   const current = models.find((item) => item.value === model);
@@ -104,9 +126,9 @@ export function kimiOptions(recorded: Settings): AgentOption[] {
 // answers its approvals and questions. Nothing runs between turns: the next message resumes the
 // session, with the model and thinking the person chose, which Kimi takes only as it starts.
 class Session {
-  readonly messages: Message[] = [];
   status: ThreadSummary['status'] = 'idle';
   updatedAt = new Date().toISOString();
+  private readonly conversation = new HostedConversation(() => !!this.turn);
   private turn?: ChildProcessWithoutNullStreams;
   private sequence = 0;
   // The reply Kimi is writing, as far as it has streamed.
@@ -117,7 +139,6 @@ class Session {
     { resolve(value: Data): void; reject(error: Error): void }
   >();
   private readonly approvals = new Map<string, Pending>();
-  private readonly requests = new Map<string, Promise<void>>();
   private readonly chosen: Settings = {};
 
   constructor(
@@ -139,16 +160,6 @@ class Session {
     });
   }
 
-  private once(id: string, action: () => Promise<void>): Promise<void> {
-    const known = this.requests.get(id);
-    if (known) return known;
-    if (this.requests.size >= MAX_REQUESTS)
-      throw new Error('Kimi command history is full; restart Dashup before sending');
-    const result = action();
-    this.requests.set(id, result);
-    return result;
-  }
-
   // What the session starts with: the person's choice, else Kimi's defaults.
   private launch(): Settings {
     const defaults = config();
@@ -165,7 +176,7 @@ class Session {
   async say(text: string): Promise<void> {
     // TurnEnd precedes the prompt acknowledgement and process exit. Its stdin is closing.
     if (this.turn && this.status === 'idle') await once(this.turn, 'exit');
-    this.messages.push({ id: randomUUID(), role: 'user', text });
+    this.conversation.messages.push({ id: randomUUID(), role: 'user', text });
     this.typing = '';
     this.status = 'working';
     this.updatedAt = new Date().toISOString();
@@ -206,6 +217,7 @@ class Session {
         this.calls.clear();
         this.approvals.clear();
         this.status = 'idle';
+        this.conversation.ended();
         this.changed();
       };
       turn.once('error', () => end('Kimi is not installed on this computer'));
@@ -223,7 +235,7 @@ class Session {
     void this.call('prompt', { user_input: text })
       .catch((error: Error) => {
         this.begun?.reject(error);
-        this.messages.push({ id: randomUUID(), role: 'system', text: error.message });
+        this.conversation.messages.push({ id: randomUUID(), role: 'system', text: error.message });
       })
       .finally(() => turn.stdin.end());
     this.changed();
@@ -253,7 +265,11 @@ class Session {
         this.typing += String(payload.text ?? '');
       } else if (type === 'TurnEnd') {
         if (this.typing)
-          this.messages.push({ id: randomUUID(), role: 'assistant', text: this.typing });
+          this.conversation.messages.push({
+            id   : randomUUID(),
+            role : 'assistant',
+            text : this.typing,
+          });
         this.typing = '';
         this.status = this.approvals.size ? 'attention' : 'idle';
       } else return;
@@ -288,7 +304,7 @@ class Session {
     this.changed();
   }
 
-  live(): LiveSession {
+  live(): LiveSession<'kimi'> {
     return {
       id        : this.id,
       cwd       : this.cwd,
@@ -296,63 +312,61 @@ class Session {
       harness   : 'kimi',
       updatedAt : this.updatedAt,
       status    : this.status,
-      messages  : [...this.messages],
+      readMessages : this.conversation.read,
+      releaseMessages : this.conversation.release,
       typing    : this.typing,
       approvals : [...this.approvals.values()].map((pending) => pending.approval),
-      send      : (requestId, text) => this.once(requestId, () => this.say(text)),
+      send      : (_requestId, text) => this.say(text),
       now       : true,
       stop      : this.turn
-        ? (requestId) =>
-            this.once(requestId, async () => {
-              await this.call('cancel');
-            })
+        ? async () => {
+            await this.call('cancel');
+          }
         : undefined,
       approve   : this.approvals.size
-        ? (requestId, approvalId, reply) =>
-            this.once(requestId, async () => {
-              const pending = this.approvals.get(approvalId);
-              const choice  = 'choice' in reply ? reply.choice : undefined;
-              if (!pending || !this.turn) throw new Error('Kimi is no longer asking');
-              // Questions name each answer by its question; skipping answers none.
-              if (pending.questions)
-                this.write({
-                  id     : pending.rpc,
-                  result : {
-                    request_id : pending.request,
-                    answers    : Object.fromEntries(
-                      'answers' in reply
-                        ? pending.questions.map((item, index) => [
-                            item.question,
-                            (reply.answers[index] ?? []).join(', '),
-                          ])
-                        : [],
-                    ),
-                  },
-                });
-              else if (CHOICES.some((value) => value.id === choice))
-                this.write({
-                  id     : pending.rpc,
-                  result : {
-                    request_id : pending.request,
-                    response   : choice,
-                    ...('text' in reply && reply.text ? { feedback: reply.text } : {}),
-                  },
-                });
-              else throw new Error('Kimi is no longer asking');
-              this.approvals.delete(approvalId);
-              if (!this.approvals.size) this.status = 'working';
-              this.changed();
-            })
+        ? async (_requestId, approvalId, reply) => {
+            const pending = this.approvals.get(approvalId);
+            const choice  = 'choice' in reply ? reply.choice : undefined;
+            if (!pending || !this.turn) throw new Error('Kimi is no longer asking');
+            // Questions name each answer by its question; skipping answers none.
+            if (pending.questions)
+              this.write({
+                id     : pending.rpc,
+                result : {
+                  request_id : pending.request,
+                  answers    : Object.fromEntries(
+                    'answers' in reply
+                      ? pending.questions.map((item, index) => [
+                          item.question,
+                          (reply.answers[index] ?? []).join(', '),
+                        ])
+                      : [],
+                  ),
+                },
+              });
+            else if (CHOICES.some((value) => value.id === choice))
+              this.write({
+                id     : pending.rpc,
+                result : {
+                  request_id : pending.request,
+                  response   : choice,
+                  ...('text' in reply && reply.text ? { feedback: reply.text } : {}),
+                },
+              });
+            else throw new Error('Kimi is no longer asking');
+            this.approvals.delete(approvalId);
+            if (!this.approvals.size) this.status = 'working';
+            this.changed();
+          }
         : undefined,
       options   : (recorded) => kimiOptions({ ...recorded(), ...this.launch() }),
       // Plan mode applies to the turn under way; the model and thinking apply as the next starts.
-      configure : (requestId, option, value) =>
-        this.once(requestId, async () => {
-          this.chosen[option] = value;
-          if (option === 'plan' && this.turn && this.status !== 'idle')
-            await this.call('set_plan_mode', { enabled: value });
-          this.changed();
-        }),
+      configure : async (_requestId, option, value) => {
+        this.chosen[option] = value;
+        if (option === 'plan' && this.turn && this.status !== 'idle')
+          await this.call('set_plan_mode', { enabled: value });
+        this.changed();
+      },
     };
   }
 
@@ -362,53 +376,36 @@ class Session {
 }
 
 export class Kimi {
+  readonly harness = 'kimi';
+  readonly recorded = kimiOptions;
   private readonly sessions = new Map<string, Session>();
-  private notify?: ReturnType<typeof setTimeout>;
+  private readonly soon = debounced(() => this.changed());
 
   constructor(private readonly changed: () => void) {}
 
-  private readonly soon = (): void => {
-    if (this.notify) return;
-    this.notify = setTimeout(() => {
-      this.notify = undefined;
-      this.changed();
-    }, NOTIFY_MS);
-    this.notify.unref();
-  };
+  async available(): Promise<boolean> {
+    return !!(await kimiCommand());
+  }
 
   // Starts a session in `cwd` with its first message, and resolves with the session's id.
   async start(cwd: string, text: string): Promise<string> {
-    const title = text.trim().split('\n')[0]!.slice(0, 80);
-    const session = new Session(randomUUID(), cwd, title, this.soon);
-    this.sessions.set(session.id, session);
-    try {
-      await session.say(text);
-    } catch (error) {
-      this.sessions.delete(session.id);
-      throw error;
-    }
+    const session = new Session(randomUUID(), cwd, firstLine(text), this.soon);
+    await hand(this.sessions, session, () => session.say(text));
     return session.id;
   }
 
   // Continues a saved session with a message; Kimi resumes it from its own session folder.
   async resume(id: string, cwd: string, text: string): Promise<void> {
-    const known = this.sessions.get(id);
-    const session = known ?? new Session(id, cwd, undefined, this.soon);
-    this.sessions.set(id, session);
-    try {
-      await session.say(text);
-    } catch (error) {
-      if (!known) this.sessions.delete(id);
-      throw error;
-    }
+    const session = this.sessions.get(id) ?? new Session(id, cwd, undefined, this.soon);
+    await hand(this.sessions, session, () => session.say(text));
   }
 
-  async refresh(): Promise<LiveSession[]> {
+  async refresh(): Promise<LiveSession<'kimi'>[]> {
     return [...this.sessions.values()].map((session) => session.live());
   }
 
   stop(): void {
-    clearTimeout(this.notify);
+    this.soon.cancel();
     for (const session of this.sessions.values()) session.end();
   }
 }

@@ -5,12 +5,15 @@ import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { newSecret, sealAttachment, openAttachment } from '@dashup/protocol/crypto';
-import { openSession, sealSession, SESSION_JOIN, SESSION_READY, SESSION_PACKET, type SessionContent, type SessionPacket, type SessionJoin } from '@dashup/protocol/session';
+import { openSession, sealSession, sealHello, openLegacySession, sealLegacySession, SESSION_JOIN, SESSION_READY, SESSION_PACKET, SESSION_PEER, SESSION_VERSION, SESSION_STREAMS, type SessionContent, type SessionPacket, type SessionJoin } from '@dashup/protocol/session';
 import { DEFAULT_NOTIFICATION_POLICY } from '@dashup/protocol/attention';
 import type { Message, Attachment, PairingRecord } from '@dashup/protocol';
 import { opaque } from '../src/attachments';
 import { Connector } from '../src/connector';
 import type { ConnectorConfig } from '../src/config';
+
+// The fixture's phone speaks session version 2 on this stream, which the computer has already met.
+const PHONE = '01'.repeat(16);
 
 async function fixture(
   run: (f: {
@@ -21,6 +24,8 @@ async function fixture(
     thread: string;
     messages: Message[];
     received: SessionContent[];
+    // A packet from the phone, sealed to the stream the computer holds as it is made.
+    packet: (content: SessionContent, stream?: string) => SessionPacket;
     send: (content: SessionContent) => Promise<void>;
     path: string;
     stops: () => number;
@@ -42,7 +47,7 @@ async function fixture(
     secret: 'test-only',
     localSecret: newSecret(randomBytes),
     device: { id: pair.device, user: 'user', kind: 'desktop', name: 'Computer', platform: 'linux' },
-    pairs: { [pair.id]: { key: newSecret(randomBytes), sequence: 0 } },
+    pairs: { [pair.id]: { key: newSecret(randomBytes), sequence: 0, session: SESSION_VERSION } },
   };
   const connector = new Connector(config);
   const received: SessionContent[] = [];
@@ -50,9 +55,10 @@ async function fixture(
   connector['isActive'] = () => true;
   connector['stream'] = '02'.repeat(16);
   connector['ready'].add(pair.id);
+  connector['admit'](pair.id, PHONE, 0);
   connector.client.send = (name: string, value: unknown) => {
     assert.equal(name, SESSION_PACKET);
-    received.push(openSession(config.pairs[pair.id]!.key, value as SessionPacket));
+    received.push(openSession(config.pairs[pair.id]!.key, value as SessionPacket, PHONE));
   };
   connector['refreshOverview'] = () => {};
   connector['scheduleSelected'] = () => {};
@@ -69,28 +75,28 @@ async function fixture(
     title: 'Chat',
     updatedAt: '2026-10-30T00:00:00Z',
     status: 'working',
-    messages,
+    readMessages: async () => ({ messages, more: false }),
     approvals: [],
     stop: async () => {
       stops++;
     },
   });
   let sequence = 0;
-  const send = (content: SessionContent) =>
-    connector['receiveSession'](
-      sealSession(
-        config.pairs[pair.id]!.key,
-        {
-          pairing: pair.id,
-          sender: pair.mobile,
-          recipient: pair.device,
-          stream: '01'.repeat(16),
-          sequence: ++sequence,
-        },
-        content,
-        randomBytes,
-      ),
+  const packet = (content: SessionContent, stream = PHONE) =>
+    sealSession(
+      config.pairs[pair.id]!.key,
+      {
+        pairing: pair.id,
+        sender: pair.mobile,
+        recipient: pair.device,
+        stream,
+        sequence: ++sequence,
+      },
+      connector['stream'],
+      content,
+      randomBytes,
     );
+  const send = (content: SessionContent) => connector['receiveSession'](packet(content));
   try {
     await run({
       connector,
@@ -100,6 +106,7 @@ async function fixture(
       thread: found.thread.id,
       messages,
       received,
+      packet,
       send,
       path,
       stops: () => stops,
@@ -135,7 +142,7 @@ async function lifecycle(f: Fixture) {
   f.connector.client.send = (event: string, value: unknown) => {
     wire.push({ event, value });
     if (event === SESSION_PACKET)
-      f.received.push(openSession(f.config.pairs[f.pair.id]!.key, value as SessionPacket));
+      f.received.push(openSession(f.config.pairs[f.pair.id]!.key, value as SessionPacket, PHONE));
   };
   f.connector.client.reconnect = async () => {};
   f.connector['refreshState'] = async () => {
@@ -249,6 +256,217 @@ test('a lost session join goes again on its stream, and a refused one at the nex
     assert.ok(f.connector['ready'].has(f.pair.id));
     t.mock.timers.tick(60_000);
     assert.equal(connection.joins().length, 4);
+  }));
+
+const routing = (f: Fixture, stream: string, sequence: number) => ({
+  pairing: f.pair.id,
+  sender: f.pair.mobile,
+  recipient: f.pair.device,
+  stream,
+  sequence,
+});
+const attach = (f: Fixture) => ({
+  type: 'chat.attach' as const,
+  projectId: f.project,
+  threadId: f.thread,
+});
+const idle: SessionContent = { type: 'phone.watch', active: false };
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+// Everything the computer sends from here on, unopened.
+function tap(f: Fixture): SessionPacket[] {
+  const wire: SessionPacket[] = [];
+  f.connector.client.send = (_event: string, value: unknown) =>
+    void wire.push(value as SessionPacket);
+  return wire;
+}
+
+function queue(f: Fixture, queueId: string) {
+  f.config.queued![queueId] = {
+    pairing: f.pair.id,
+    project: f.project,
+    thread: f.thread,
+    receipt: { state: 'accepted', queueId },
+    owner: {
+      pid: 1,
+      start: 'fixture',
+      executable: '/fixture',
+      home: '/fixture',
+      cwd: '/fixture',
+      thread: 'native',
+      version: 'fixture',
+      rollout: { path: '/fixture/rollout', device: 1, inode: 1 },
+      queue: { path: '/fixture/queue', device: 1, inode: 2 },
+    },
+  };
+  f.connector.nativeQueue.reconcile = () => ({ state: 'accepted', queueId });
+}
+
+test('a hello is answered with a welcome and changes nothing; a packet sealed to this stream moves the phone', () =>
+  fixture(async (f) => {
+    const key = f.config.pairs[f.pair.id]!.key;
+    const next = '03'.repeat(16);
+    queue(f, 'queued-native');
+    await f.send(attach(f));
+    const wire = tap(f);
+    const hello = sealHello(key, routing(f, next, 1), randomBytes);
+    await f.connector['receiveSession'](hello);
+    await f.connector['receiveSession'](hello);
+    assert.equal(wire.length, 2);
+    for (const packet of wire) {
+      assert.equal(packet.stream, f.connector['stream']);
+      assert.deepEqual(openSession(key, packet, next), { type: 'welcome' });
+      assert.throws(() => openSession(key, packet, PHONE));
+    }
+    assert.equal(f.connector['phones'].get(f.pair.id)!.stream, PHONE);
+    assert.equal(f.connector['selected'].size, 1);
+
+    await f.connector['receiveSession'](f.packet(idle, next));
+    await tick();
+    assert.equal(f.connector['phones'].get(f.pair.id)!.stream, next);
+    assert.equal(f.connector['selected'].size, 0);
+    const receipts = wire.slice(2).map((packet) => openSession(key, packet, next));
+    assert.ok(
+      receipts.some(
+        (content) => content.type === 'result' && content.requestId === 'queued-native',
+      ),
+    );
+  }));
+
+test('nothing sealed before either end reconnected is taken again, nor a late packet from a stream the phone left', () =>
+  fixture(async (f) => {
+    const wire = tap(f);
+    const recorded = f.packet(attach(f));
+    await f.connector['receiveSession'](recorded);
+    assert.equal(f.connector['selected'].size, 1);
+    await f.send({ ...attach(f), type: 'chat.detach' });
+    const sent = wire.length;
+    const refused = async (packet: SessionPacket) => {
+      await f.connector['receiveSession'](packet);
+      assert.equal(f.connector['selected'].size, 0);
+      assert.equal(wire.length, sent);
+    };
+    await refused(recorded);
+
+    // This computer reconnects: what was sealed to its earlier stream no longer opens.
+    const undelivered = f.packet(attach(f));
+    f.connector['stream'] = '04'.repeat(16);
+    await refused(recorded);
+    await refused(undelivered);
+
+    // The phone reconnects: its earlier stream stays behind, even for a packet never delivered.
+    const next = '03'.repeat(16);
+    const held = f.packet(attach(f));
+    await f.connector['receiveSession'](f.packet(idle, next));
+    assert.equal(f.connector['phones'].get(f.pair.id)!.stream, next);
+    await refused(held);
+    await f.connector['receiveSession'](f.packet(attach(f), next));
+    assert.equal(f.connector['selected'].size, 1);
+  }));
+
+test('past the bound of phone streams the computer takes a new stream, and no earlier stream returns', () =>
+  fixture(async (f) => {
+    tap(f);
+    const own = f.connector['stream'];
+    const stream = (at: number) => (16 + at).toString(16).repeat(16);
+    const recorded = f.packet(idle, stream(1));
+    await f.connector['receiveSession'](recorded);
+    for (let at = 2; at < SESSION_STREAMS; at++)
+      await f.connector['receiveSession'](f.packet(idle, stream(at)));
+    assert.equal(f.connector['phones'].get(f.pair.id)!.seen.size, SESSION_STREAMS);
+    assert.equal(f.connector['stream'], own);
+
+    const last = stream(SESSION_STREAMS);
+    await f.connector['receiveSession'](f.packet(attach(f), last));
+    assert.equal(f.connector['selected'].size, 1);
+    assert.notEqual(f.connector['stream'], own);
+    assert.match(f.connector['stream'], /^[a-f0-9]{32}$/);
+    assert.equal(f.connector['ready'].size, 0);
+    assert.deepEqual([...f.connector['phones'].get(f.pair.id)!.seen.keys()], [last]);
+
+    f.connector['ready'].add(f.pair.id);
+    await f.connector['receiveSession'](recorded);
+    assert.equal(f.connector['phones'].get(f.pair.id)!.stream, last);
+    await f.connector['receiveSession'](f.packet({ ...attach(f), type: 'chat.detach' }, last));
+    assert.equal(f.connector['selected'].size, 0);
+  }));
+
+test('a version 1 phone is served as before until it first speaks version 2, and is then held to it', () =>
+  fixture(async (f) => {
+    const local = f.config.pairs[f.pair.id]!;
+    delete local.session;
+    f.connector['phones'].clear();
+    const wire = tap(f);
+    const old = (sequence: number, stream = PHONE) =>
+      sealLegacySession(local.key, routing(f, stream, sequence), attach(f), randomBytes);
+    await f.connector['receiveSession'](old(1));
+    assert.ok(wire.length >= 2);
+    assert.ok(wire.every((packet) => packet.v === 1));
+    assert.equal(openLegacySession(local.key, wire[0]!).type, 'chat.page');
+    assert.equal(local.session, undefined);
+    let sent = wire.length;
+    await f.connector['receiveSession'](old(1));
+    assert.equal(wire.length, sent);
+
+    const next = '03'.repeat(16);
+    await f.connector['receiveSession'](sealHello(local.key, routing(f, next, 1), randomBytes));
+    assert.equal(local.session, SESSION_VERSION);
+    const saved = JSON.parse(readFileSync(f.path, 'utf8')) as ConnectorConfig;
+    assert.equal(saved.pairs[f.pair.id]?.session, SESSION_VERSION);
+    assert.equal(wire.length, sent + 1);
+    assert.deepEqual(openSession(local.key, wire[sent]!, next), { type: 'welcome' });
+    assert.equal(f.connector['linked'](f.pair.id), false);
+
+    sent = wire.length;
+    await f.connector['receiveSession'](old(2));
+    await f.connector['receiveSession'](old(1, '05'.repeat(16)));
+    assert.equal(wire.length, sent);
+    assert.equal(f.connector['linked'](f.pair.id), false);
+
+    await f.connector['receiveSession'](f.packet(attach(f), next));
+    assert.ok(wire.length > sent);
+    assert.ok(wire.slice(sent).every((packet) => packet.v === SESSION_VERSION));
+    assert.equal(openSession(local.key, wire[sent]!, next).type, 'chat.page');
+  }));
+
+test('the relay’s word moves a version 1 phone to a new stream and only ends pushes to a version 2 phone', () =>
+  fixture(async (f) => {
+    const connection = await lifecycle(f);
+    connection.emit('connected');
+    connection.emit('resync-required');
+    connection.emit(SESSION_READY, { ...connection.joins()[0]!, ok: true });
+    queue(f, 'queued-native');
+    const moved = { pairing: f.pair.id, device: f.pair.mobile, stream: '03'.repeat(16) };
+    await f.send(attach(f));
+    assert.equal(f.connector['selected'].size, 1);
+    const wire = tap(f);
+
+    connection.emit(SESSION_PEER, { ...moved, connected: true });
+    await tick();
+    assert.equal(f.connector['selected'].size, 0);
+    assert.equal(f.connector['phones'].get(f.pair.id)!.stream, PHONE);
+    assert.equal(wire.length, 0);
+    await f.send(attach(f));
+    assert.equal(f.connector['selected'].size, 1);
+    connection.emit(SESSION_PEER, { ...moved, connected: false });
+    assert.equal(f.connector['selected'].size, 1);
+    connection.emit(SESSION_PEER, { ...moved, stream: PHONE, connected: false });
+    assert.equal(f.connector['selected'].size, 0);
+
+    const local = f.config.pairs[f.pair.id]!;
+    delete local.session;
+    f.connector['phones'].clear();
+    wire.length = 0;
+    connection.emit(SESSION_PEER, { ...moved, connected: true });
+    await tick();
+    assert.equal(f.connector['phones'].get(f.pair.id)!.stream, moved.stream);
+    const receipt = openLegacySession(local.key, wire.at(-1)!);
+    assert.ok(receipt.type === 'result' && receipt.requestId === 'queued-native');
+  }));
+
+test('the dashboard names the session version this computer speaks', () =>
+  fixture(async (f) => {
+    assert.equal(f.connector['overview'](f.pair).session, SESSION_VERSION);
   }));
 
 test('opening a chat sends only the latest page before metadata without scanning other sources or writing configuration', () =>
@@ -483,24 +701,7 @@ test('dashboard size trimming keeps the project card for every retained session'
 test('a phone reconnect receives current queue receipts even when their state has not changed', () =>
   fixture(async (f) => {
     const queueId = 'queued-native';
-    f.config.queued![queueId] = {
-      pairing: f.pair.id,
-      project: f.project,
-      thread: f.thread,
-      receipt: { state: 'accepted', queueId },
-      owner: {
-        pid: 1,
-        start: 'fixture',
-        executable: '/fixture',
-        home: '/fixture',
-        cwd: '/fixture',
-        thread: 'native',
-        version: 'fixture',
-        rollout: { path: '/fixture/rollout', device: 1, inode: 1 },
-        queue: { path: '/fixture/queue', device: 1, inode: 2 },
-      },
-    };
-    f.connector.nativeQueue.reconcile = () => ({ state: 'accepted', queueId });
+    queue(f, queueId);
     await f.connector['publishQueueReceipts']();
     await f.connector['publishQueueReceipts']();
     assert.equal(
@@ -965,7 +1166,6 @@ test('async native stores establish the actual pre-send boundary and never norma
     const native = writable(f, async (_request, text) => {
       nativeMessages.push({ id: 'native-new', role: 'user', text: `Injected context\n${text}` });
     });
-    native.messages = [];
     let reads = 0;
     native.readMessages = async () => {
       reads++;
@@ -993,7 +1193,6 @@ test('older native attachments resolve by their sent-page origin after latest re
     const native = f.connector.discovery.locations.get(f.thread)!.live!;
     const anchors: Array<string | undefined> = [];
     let old = true;
-    native.messages = [];
     native.readMessages = async (before) => {
       anchors.push(before);
       return { messages: before === older.id || old ? [older] : [newest], more: false };

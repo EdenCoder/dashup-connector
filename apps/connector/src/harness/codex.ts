@@ -12,8 +12,8 @@ import type { Message, Approval, AgentOption, ThreadSummary } from '@dashup/prot
 import { contextUsage, type ContextUsage } from '@dashup/protocol/context';
 
 import { version as DASHUP_VERSION } from '../../package.json';
-import { nativeProcesses } from './processes';
-import { EARLIER, NO_PREVIEW, MAX_PREVIEW, INPUT_IMAGE_TYPES, type Settings, type InputFile, type LiveSession } from './session';
+import { commandRuns, nativeProcesses } from './processes';
+import { EARLIER, debounced, NO_PREVIEW, MAX_PREVIEW, liveDiscovery, INPUT_IMAGE_TYPES, type Settings, type InputFile, type LiveSession } from './session';
 
 // =============================================================================
 // Existing Codex control sockets
@@ -116,7 +116,7 @@ function models(): Model[] {
 
 // The model and reasoning effort a thread last ran with, among those Codex lists, and its fast
 // mode where that model has the priority tier.
-export function codexModels(): NonNullable<AgentOption['choices']> {
+function codexModels(): NonNullable<AgentOption['choices']> {
   return models()
     .filter((model) => model.visibility !== 'hide')
     .map((model) => ({ value: model.slug, name: model.display_name ?? model.slug }));
@@ -159,7 +159,7 @@ export function codexOptions(recorded: Settings): AgentOption[] {
 async function sockets(): Promise<string[]> {
   const explicit = process.env.DASHUP_CODEX_SOCKET;
   if (explicit !== undefined) return explicit && isAbsolute(explicit) ? [explicit] : [];
-  if (process.env.DASHUP_LIVE_DISCOVERY === '0') return [];
+  if (!liveDiscovery()) return [];
   const homes = new Set([codexHome()]);
   if (process.platform === 'linux') {
     for (const pid of nativeProcesses('codex')) {
@@ -237,10 +237,9 @@ class Client {
   private sequence = 0;
   private controls = false;
   private activeInput = false;
-  private notify?: ReturnType<typeof setTimeout>;
+  private readonly soon = debounced(() => this.changed());
   private readonly pending = new Map<number, Waiting>();
   private readonly approvals = new Map<string, NativeApproval>();
-  private readonly requests = new Map<string, Promise<void>>();
   // The reply each thread is writing, as far as it has streamed, and the item it belongs to.
   private readonly typing = new Map<string, { item: unknown; text: string }>();
   // What the person chose for each thread, which its next turn takes and keeps.
@@ -342,13 +341,7 @@ class Client {
             approval: approval(id, message.method, params),
           });
         }
-        if (/^(thread|turn|item|serverRequest)\//.test(message.method) && !this.notify) {
-          this.notify = setTimeout(() => {
-            this.notify = undefined;
-            this.changed();
-          }, 100);
-          this.notify.unref();
-        }
+        if (/^(thread|turn|item|serverRequest)\//.test(message.method)) this.soon();
       });
       socket.on('close', () => {
         if (this.socket !== socket) return;
@@ -418,16 +411,6 @@ class Client {
     });
   }
 
-  private once(id: string, action: () => Promise<void>): Promise<void> {
-    const known = this.requests.get(id);
-    if (known) return known;
-    if (this.requests.size >= 1000)
-      throw new Error('Codex command history is full; reconnect before sending');
-    const result = action();
-    this.requests.set(id, result);
-    return result;
-  }
-
   // Starts a thread in `cwd` with Codex's own settings, or loads a saved one, then a turn.
   async start(
     cwd: string,
@@ -480,11 +463,11 @@ class Client {
     return { turns: Array.isArray(read.thread?.turns) ? read.thread.turns : [], earlier: false };
   }
 
-  async read(): Promise<LiveSession[]> {
+  async read(): Promise<LiveSession<'codex'>[]> {
     await this.connect();
     const loaded = await this.call('thread/loaded/list', { limit: MAX_SESSIONS });
     if (!Array.isArray(loaded.data)) return [];
-    const sessions: LiveSession[] = [];
+    const sessions: LiveSession<'codex'>[] = [];
     for (const id of this.typing.keys()) if (!loaded.data.includes(id)) this.typing.delete(id);
     for (const id of this.contexts.keys()) if (!loaded.data.includes(id)) this.contexts.delete(id);
     for (const id of loaded.data.slice(0, MAX_SESSIONS)) {
@@ -494,8 +477,6 @@ class Client {
         const thread = read.thread;
         if (thread?.id !== id || typeof thread.cwd !== 'string' || !thread.cwd) continue;
         if (thread.status?.type !== 'active') this.typing.delete(id);
-        // History hydration must not hide a loaded thread's status or controls.
-        const history = await this.history(thread).catch(() => ({ turns: [], earlier: false }));
         const approvals = [...this.approvals.values()]
           .filter((value) => value.threadId === id)
           .map((value) => value.approval);
@@ -511,88 +492,91 @@ class Client {
                 : 'Codex thread',
           updatedAt: new Date(Number(thread.updatedAt ?? 0) * 1000).toISOString(),
           status: approvals.length ? 'attention' : status(thread),
-          messages: [...(history.earlier ? [EARLIER] : []), ...messages(history)],
+          // A thread whose turns cannot be read shows none.
+          readMessages: async () => {
+            const history = await this.history(thread).catch(() => ({ turns: [], earlier: false }));
+            return {
+              messages: [...(history.earlier ? [EARLIER] : []), ...messages(history)],
+              more: false,
+            };
+          },
           typing: this.typing.get(id)?.text,
           context: this.contexts.get(id),
           approvals,
           // An interrupt for a finished turn is never answered, so the active turn is read first.
           stop: this.controls
-            ? (requestId) =>
-                this.once(requestId, async () => {
-                  const native = (
-                    await this.call('thread/read', { threadId: id, includeTurns: false })
-                  ).thread;
-                  const turn =
-                    native?.status?.type === 'active'
-                      ? (await this.history(native, 1, 'notLoaded')).turns.at(-1)
-                      : undefined;
-                  if (turn?.status !== 'inProgress' || typeof turn.id !== 'string')
-                    throw new Error('Nothing is running in this Codex thread');
-                  await this.call('turn/interrupt', { threadId: id, turnId: turn.id });
-                  this.changed();
-                })
+            ? async () => {
+                const native = (
+                  await this.call('thread/read', { threadId: id, includeTurns: false })
+                ).thread;
+                const turn =
+                  native?.status?.type === 'active'
+                    ? (await this.history(native, 1, 'notLoaded')).turns.at(-1)
+                    : undefined;
+                if (turn?.status !== 'inProgress' || typeof turn.id !== 'string')
+                  throw new Error('Nothing is running in this Codex thread');
+                await this.call('turn/interrupt', { threadId: id, turnId: turn.id });
+                this.changed();
+              }
             : undefined,
           send: this.acceptsInput(thread)
-            ? (requestId, text, _now, files) =>
-                this.once(requestId, async () => {
-                  if (!text.trim() || Buffer.byteLength(text) > MAX_BYTES / 2)
-                    throw new Error('Message is empty or too large');
-                  const current = await this.call('thread/loaded/list', { limit: MAX_SESSIONS });
-                  if (!Array.isArray(current.data) || !current.data.includes(id))
-                    throw new Error('Codex thread is no longer loaded');
-                  const native = (
-                    await this.call('thread/read', { threadId: id, includeTurns: false })
-                  ).thread;
-                  if (native?.id !== id || !this.acceptsInput(native))
-                    throw new Error('Codex thread is busy or unavailable');
-                  const chosen = this.chosen.get(id) ?? {};
-                  await this.call('turn/start', {
-                    threadId: id,
-                    clientUserMessageId: requestId,
-                    input: input(text, files),
-                    ...('model' in chosen ? { model: chosen.model } : {}),
-                    ...('effort' in chosen ? { effort: chosen.effort } : {}),
-                    ...('fast' in chosen ? { serviceTier: chosen.fast ? 'priority' : null } : {}),
-                    ...('auto' in chosen
-                      ? {
-                          approvalPolicy: 'on-request',
-                          approvalsReviewer: chosen.auto ? 'auto_review' : 'user',
-                        }
-                      : {}),
-                  });
-                  this.changed();
-                })
+            ? async (requestId, text, _now, files) => {
+                if (!text.trim() || Buffer.byteLength(text) > MAX_BYTES / 2)
+                  throw new Error('Message is empty or too large');
+                const current = await this.call('thread/loaded/list', { limit: MAX_SESSIONS });
+                if (!Array.isArray(current.data) || !current.data.includes(id))
+                  throw new Error('Codex thread is no longer loaded');
+                const native = (
+                  await this.call('thread/read', { threadId: id, includeTurns: false })
+                ).thread;
+                if (native?.id !== id || !this.acceptsInput(native))
+                  throw new Error('Codex thread is busy or unavailable');
+                const chosen = this.chosen.get(id) ?? {};
+                await this.call('turn/start', {
+                  threadId: id,
+                  clientUserMessageId: requestId,
+                  input: input(text, files),
+                  ...('model' in chosen ? { model: chosen.model } : {}),
+                  ...('effort' in chosen ? { effort: chosen.effort } : {}),
+                  ...('fast' in chosen ? { serviceTier: chosen.fast ? 'priority' : null } : {}),
+                  ...('auto' in chosen
+                    ? {
+                        approvalPolicy: 'on-request',
+                        approvalsReviewer: chosen.auto ? 'auto_review' : 'user',
+                      }
+                    : {}),
+                });
+                this.changed();
+              }
             : undefined,
           options: (recorded) => codexOptions({ ...recorded(), ...this.chosen.get(id) }),
           configure: this.controls
-            ? (requestId, option, value) =>
-                this.once(requestId, async () => {
-                  this.chosen.set(id, { ...this.chosen.get(id), [option]: value });
-                  this.changed();
-                })
+            ? async (_requestId, option, value) => {
+                this.chosen.set(id, { ...this.chosen.get(id), [option]: value });
+                this.changed();
+              }
             : undefined,
           approve: approvals.length
-            ? (requestId, approvalId, reply) =>
-                this.once(requestId, async () => {
-                  const approval = this.approvals.get(approvalId);
-                  const choice = 'choice' in reply ? reply.choice : undefined;
-                  const socket = this.socket;
-                  if (
-                    !approval ||
-                    approval.threadId !== id ||
-                    !approval.approval.choices.some((value) => value.id === choice) ||
-                    socket?.readyState !== WebSocket.OPEN
-                  )
-                    throw new Error('Codex approval is no longer pending');
-                  await new Promise<void>((resolve, reject) =>
-                    socket.send(
-                      JSON.stringify({ id: approval.requestId, result: { decision: choice } }),
-                      (error) =>
-                        error ? reject(new Error('Codex approval could not be sent')) : resolve(),
-                    ));
-                  this.approvals.delete(approvalId);
-                  this.changed();
-                })
+            ? async (_requestId, approvalId, reply) => {
+                const approval = this.approvals.get(approvalId);
+                const choice = 'choice' in reply ? reply.choice : undefined;
+                const socket = this.socket;
+                if (
+                  !approval ||
+                  approval.threadId !== id ||
+                  !approval.approval.choices.some((value) => value.id === choice) ||
+                  socket?.readyState !== WebSocket.OPEN
+                )
+                  throw new Error('Codex approval is no longer pending');
+                await new Promise<void>((resolve, reject) =>
+                  socket.send(
+                    JSON.stringify({ id: approval.requestId, result: { decision: choice } }),
+                    (error) =>
+                      error ? reject(new Error('Codex approval could not be sent')) : resolve(),
+                  ));
+                this.approvals.delete(approvalId);
+                this.changed();
+              }
             : undefined,
         });
       } catch {
@@ -604,7 +588,7 @@ class Client {
 
   stop(): void {
     this.stopped = true;
-    clearTimeout(this.notify);
+    this.soon.cancel();
     this.socket?.terminate();
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
@@ -617,18 +601,25 @@ class Client {
 }
 
 export class Codex {
+  readonly harness = 'codex';
+  readonly models = codexModels;
+  readonly recorded = codexOptions;
   private readonly clients = new Map<string, Client>();
   // Control sockets of daemons this connector started, which discovery may not look for.
   private readonly started = new Set<string>();
   constructor(private readonly changed: () => void) {}
 
+  available(): Promise<boolean> {
+    return commandRuns('codex');
+  }
+
   // Codex's own daemon runs the threads Dashup starts or resumes, so they outlive this connector.
   async start(
     cwd: string,
     text: string,
-    saved?: string,
     files?: InputFile[],
     model?: string,
+    saved?: string,
   ): Promise<string> {
     const path = process.env.DASHUP_CODEX_SOCKET || join(codexHome(), ...SOCKET_PARTS);
     await promisify(execFile)('codex', ['app-server', 'daemon', 'start'], {
@@ -645,10 +636,10 @@ export class Codex {
   }
 
   async resume(id: string, cwd: string, text: string, files?: InputFile[]): Promise<void> {
-    await this.start(cwd, text, id, files);
+    await this.start(cwd, text, files, undefined, id);
   }
 
-  async refresh(): Promise<LiveSession[]> {
+  async refresh(): Promise<LiveSession<'codex'>[]> {
     const paths = new Set([...(await sockets()), ...this.started]);
     for (const [path, client] of this.clients)
       if (!paths.has(path)) {

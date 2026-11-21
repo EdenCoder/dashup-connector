@@ -79,19 +79,138 @@ process.stdin.resume();
   const headless = new Headless(() => {});
   try {
     await headless.start(root, 'Fix the build');
-    const until = async (done: (session: LiveSession) => boolean) => {
-      for (let wait = 0; wait < 100 && !done((await headless.refresh())[0]!); wait++)
+    const until = async (done: (session: LiveSession) => boolean | Promise<boolean>) => {
+      for (let wait = 0; wait < 100 && !(await done((await headless.refresh())[0]!)); wait++)
         await new Promise((resolve) => setTimeout(resolve, 10));
       return (await headless.refresh())[0]!;
     };
     const writing = await until((session) => !!session.typing?.endsWith('build'));
     assert.equal(writing.typing, 'Fixing the build');
-    const done = await until((session) => session.messages.length > 1);
+    const done = await until(
+      async (session) => (await session.readMessages!()).messages.length > 1,
+    );
     assert.equal(done.typing, '');
     assert.deepEqual(
-      done.messages.map((message) => message.text),
+      (await done.readMessages!()).messages.map((message) => message.text),
       ['Fix the build', 'Fixing the build'],
     );
+  } finally {
+    process.env.PATH = path;
+    headless.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+type Host = { refresh(): Promise<LiveSession[]> };
+
+const listed = async (host: Host, id: string) =>
+  (await host.refresh()).find((session) => session.id === id)!;
+
+// What a phone that opens the conversation reads; opening it follows it.
+const read = async (host: Host, id: string) =>
+  (await (await listed(host, id)).readMessages!()).messages.map((message) => message.text);
+
+// Waits until the session's turn has ended and its process with it.
+async function ended(host: Host, id: string): Promise<void> {
+  for (let wait = 0; wait < 200 && (await listed(host, id)).stop; wait++)
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal((await listed(host, id)).stop, undefined);
+}
+
+test('a hosted session lets go of its conversation when its turn ends, unless a phone still reads it', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dashup-headless-release-'));
+  const path = process.env.PATH;
+  const go = join(root, 'go');
+  // Claude Code whose turn ends once the test writes `go`.
+  writeFileSync(
+    join(root, 'claude'),
+    `#!/usr/bin/env node
+if (!process.argv.includes('--include-partial-messages')) process.exit(2);
+const { existsSync } = require('node:fs');
+const say = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+require('node:readline').createInterface({ input: process.stdin }).on('line', (line) => {
+  if (JSON.parse(line).type !== 'user') return;
+  say({ type: 'system', subtype: 'init' });
+  say({ type: 'assistant', uuid: String(Math.random()), message: { content: [{ type: 'text', text: 'Done' }] } });
+  const end = () => (existsSync(${JSON.stringify(go)}) ? say({ type: 'result' }) : setTimeout(end, 10));
+  end();
+});
+`,
+    { mode: 0o755 },
+  );
+  process.env.PATH = `${root}:${path}`;
+  const headless = new Headless(() => {});
+  const replied = async (id: string) => {
+    for (let wait = 0; wait < 200 && (await read(headless, id)).length < 2; wait++)
+      await new Promise((resolve) => setTimeout(resolve, 10));
+  };
+  try {
+    const unread = await headless.start(root, 'Nobody reads this');
+    const followed = await headless.start(root, 'A phone reads this');
+    await replied(followed);
+    writeFileSync(go, '');
+    await ended(headless, unread);
+    await ended(headless, followed);
+    assert.deepEqual(await read(headless, followed), ['A phone reads this', 'Done']);
+    assert.deepEqual(await read(headless, unread), []);
+    (await listed(headless, followed)).releaseMessages!();
+    assert.deepEqual(await read(headless, followed), []);
+    // Let go during a turn, a conversation stays until the turn ends.
+    rmSync(go);
+    await headless.resume(followed, root, 'Again');
+    await replied(followed);
+    (await listed(headless, followed)).releaseMessages!();
+    assert.deepEqual(await read(headless, followed), ['Again', 'Done']);
+    (await listed(headless, followed)).releaseMessages!();
+    writeFileSync(go, '');
+    await ended(headless, followed);
+    assert.deepEqual(await read(headless, followed), []);
+    // Its record stays, so the person still chooses what its next turn runs with.
+    assert.ok((await listed(headless, followed)).configure);
+  } finally {
+    writeFileSync(go, '');
+    process.env.PATH = path;
+    headless.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a hosted session that could not take its first message is forgotten, and one already listed stays', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dashup-headless-refused-'));
+  const path = process.env.PATH;
+  const refusing = join(root, 'refusing');
+  // Claude Code that runs turns until it is told to refuse them.
+  writeFileSync(
+    join(root, 'claude'),
+    `#!/usr/bin/env node
+if (!process.argv.includes('--include-partial-messages')) process.exit(2);
+if (require('node:fs').existsSync(${JSON.stringify(refusing)})) {
+  console.error('No turns today');
+  process.exit(1);
+}
+const say = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
+process.stdin.once('data', () => {
+  say({ type: 'system', subtype: 'init' });
+  say({ type: 'result' });
+});
+process.stdin.resume();
+`,
+    { mode: 0o755 },
+  );
+  process.env.PATH = `${root}:${path}`;
+  const headless = new Headless(() => {});
+  const listed = async () => (await headless.refresh()).map((session) => session.id);
+  try {
+    const id = await headless.start(root, 'First line\nSecond line');
+    assert.equal((await headless.refresh())[0]!.title, 'First line');
+    for (let wait = 0; wait < 200 && (await headless.refresh())[0]!.status !== 'idle'; wait++)
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    writeFileSync(refusing, '');
+    await assert.rejects(headless.start(root, 'A new session'), /No turns today/);
+    await assert.rejects(headless.resume('saved-session', root, 'A saved one'), /No turns today/);
+    assert.deepEqual(await listed(), [id]);
+    await assert.rejects(headless.resume(id, root, 'The listed one'), /No turns today/);
+    assert.deepEqual(await listed(), [id]);
   } finally {
     process.env.PATH = path;
     headless.stop();
@@ -109,9 +228,11 @@ test('a phone-started Claude session receives uploaded images as native image bl
     'base64',
   );
   writeFileSync(image, bytes);
+  // The turn stays under way, so the session still holds the message it was sent.
   writeFileSync(
     join(root, 'claude'),
     `#!/usr/bin/env node
+if (!process.argv.includes('--include-partial-messages')) process.exit(2);
 const { writeFileSync } = require('node:fs');
 const say = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
 require('node:readline').createInterface({ input: process.stdin }).on('line', (line) => {
@@ -119,7 +240,6 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', (l
   if (message.type !== 'user') return;
   writeFileSync(${JSON.stringify(heard)}, JSON.stringify(message.message.content));
   say({ type: 'system', subtype: 'init' });
-  say({ type: 'result' });
 });
 `,
     { mode: 0o755 },
@@ -135,7 +255,7 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', (l
         source: { type: 'base64', media_type: 'image/png', data: bytes.toString('base64') },
       },
     ]);
-    const history = (await headless.refresh())[0]!.messages;
+    const { messages: history } = await (await headless.refresh())[0]!.readMessages!();
     assert.equal(history[0]!.attachments?.[0]?.mime, 'image/png');
     assert.equal(history[0]!.attachments?.[0]?.name, 'phone.png');
   } finally {
@@ -449,6 +569,8 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', (l
   try {
     const id = await kimi.start(root, 'Run the tests');
     let session = await until((session) => session.approvals.length === 1);
+    // A phone reads the conversation while Kimi asks, so it is held once the turn ends.
+    await session.readMessages!();
     const [approval] = session.approvals;
     assert.equal(approval!.title, 'Allow run shell command?');
     assert.deepEqual(
@@ -472,7 +594,7 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', (l
     await session.approve!('dashup-approve', approval!.id, { choice: 'approve' });
     session = await until((session) => session.status === 'idle');
     assert.deepEqual(
-      session.messages.map((message) => [message.role, message.text]),
+      (await session.readMessages!()).messages.map((message) => [message.role, message.text]),
       [
         ['user', 'Run the tests'],
         ['assistant', 'Running done'],
@@ -504,6 +626,129 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', (l
       ],
     );
   } finally {
+    process.env.PATH = path;
+    if (home === undefined) delete process.env.DASHUP_KIMI_HOME;
+    else process.env.DASHUP_KIMI_HOME = home;
+    kimi.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Kimi’s config reads as a person may edit it, and what it cannot read is absent rather than thrown', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dashup-kimi-config-'));
+  const path = process.env.PATH;
+  const home = process.env.DASHUP_KIMI_HOME;
+  const argv = join(root, 'argv.json');
+  writeFileSync(
+    join(root, 'kimi'),
+    `#!/usr/bin/env node
+if (process.argv.includes('--version')) return console.log('kimi, version 1.52.0');
+require('node:fs').writeFileSync(${JSON.stringify(argv)}, JSON.stringify(process.argv.slice(2)));
+const say = (value) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...value }) + '\\n');
+const event = (type) => say({ method: 'event', params: { type, payload: {} } });
+require('node:readline').createInterface({ input: process.stdin }).on('line', (line) => {
+  const message = JSON.parse(line);
+  if (message.method === 'initialize') say({ id: message.id, result: { protocol_version: '1.10' } });
+  if (message.method !== 'prompt') return;
+  event('TurnBegin');
+  event('TurnEnd');
+  say({ id: message.id, result: { status: 'finished' } });
+});
+`,
+    { mode: 0o755 },
+  );
+  const toml = (...lines: string[]) => writeFileSync(join(root, 'config.toml'), lines.join('\n'));
+  toml(
+    "default_model = 'kimi-code/k3' # the one a session starts with",
+    'default_thinking = true # think first',
+    '[models."kimi-code/k3"] # the newest',
+    "display_name = 'K3 \\ preview' # a literal string keeps its backslash",
+    `capabilities = ['thinking', "image_in"]`,
+    "[models.'kimi-code/k2']",
+    'display_name = "K2.7 \\"Coding\\"" # with escapes',
+    'capabilities = ["image_in"] # not "thinking"',
+    '[models."kimi-code/k1"]',
+    'display_name = "unclosed',
+    '[loop_control]',
+    'default_model = "not the default"',
+  );
+  process.env.PATH = `${root}:${path}`;
+  process.env.DASHUP_KIMI_HOME = root;
+  const kimi = new Kimi(() => {});
+  try {
+    const [model, thinking] = kimi.recorded({ model: 'kimi-code/k3', thinking: false });
+    assert.deepEqual(model!.choices, [
+      { value: 'kimi-code/k3', name: 'K3 \\ preview' },
+      { value: 'kimi-code/k2', name: 'K2.7 "Coding"' },
+      { value: 'kimi-code/k1', name: 'kimi-code/k1' },
+    ]);
+    assert.deepEqual(thinking, { id: 'thinking', name: 'Thinking', value: false });
+    assert.equal(kimi.recorded({ model: 'kimi-code/k2', thinking: false }).length, 1);
+    await kimi.start(root, 'Hello');
+    assert.deepEqual(JSON.parse(readFileSync(argv, 'utf8')).slice(-3), [
+      '--model',
+      'kimi-code/k3',
+      '--thinking',
+    ]);
+    // A value in a form Kimi's config does not use reads as absent.
+    toml('default_model = ["kimi-code/k3"]', "default_thinking = 'yes'", '[models."k4" # open');
+    const [fallback, ...rest] = kimi.recorded({ model: 'kimi-code/k3' });
+    assert.deepEqual(fallback!.choices, [{ value: 'kimi-code/k3', name: 'kimi-code/k3' }]);
+    assert.deepEqual(rest, []);
+    const again = await kimi.start(root, 'Again');
+    assert.deepEqual(JSON.parse(readFileSync(argv, 'utf8')).slice(-2), ['--session', again]);
+  } finally {
+    process.env.PATH = path;
+    if (home === undefined) delete process.env.DASHUP_KIMI_HOME;
+    else process.env.DASHUP_KIMI_HOME = home;
+    kimi.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a Kimi session lets go of its conversation when its turn ends, unless a phone still reads it', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dashup-kimi-release-'));
+  const path = process.env.PATH;
+  const home = process.env.DASHUP_KIMI_HOME;
+  const go = join(root, 'go');
+  // Kimi's wire mode, whose turn ends once the test writes `go`.
+  writeFileSync(
+    join(root, 'kimi'),
+    `#!/usr/bin/env node
+const { existsSync } = require('node:fs');
+if (process.argv.includes('--version')) return console.log('kimi, version 1.52.0');
+const say = (value) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...value }) + '\\n');
+const event = (type, payload = {}) => say({ method: 'event', params: { type, payload } });
+require('node:readline').createInterface({ input: process.stdin }).on('line', (line) => {
+  const message = JSON.parse(line);
+  if (message.method === 'initialize') say({ id: message.id, result: { protocol_version: '1.10' } });
+  if (message.method !== 'prompt') return;
+  event('TurnBegin', { user_input: message.params.user_input });
+  event('ContentPart', { type: 'text', text: 'Done' });
+  const end = () => existsSync(${JSON.stringify(go)})
+    ? (event('TurnEnd'), say({ id: message.id, result: { status: 'finished' } }))
+    : setTimeout(end, 10);
+  end();
+});
+`,
+    { mode: 0o755 },
+  );
+  process.env.PATH = `${root}:${path}`;
+  process.env.DASHUP_KIMI_HOME = root;
+  const kimi = new Kimi(() => {});
+  try {
+    const unread = await kimi.start(root, 'Nobody reads this');
+    const followed = await kimi.start(root, 'A phone reads this');
+    assert.deepEqual(await read(kimi, followed), ['A phone reads this']);
+    writeFileSync(go, '');
+    await ended(kimi, unread);
+    await ended(kimi, followed);
+    assert.deepEqual(await read(kimi, followed), ['A phone reads this', 'Done']);
+    assert.deepEqual(await read(kimi, unread), []);
+    (await listed(kimi, followed)).releaseMessages!();
+    assert.deepEqual(await read(kimi, followed), []);
+  } finally {
+    writeFileSync(go, '');
     process.env.PATH = path;
     if (home === undefined) delete process.env.DASHUP_KIMI_HOME;
     else process.env.DASHUP_KIMI_HOME = home;

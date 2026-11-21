@@ -629,3 +629,69 @@ test('a failed approval dismissal stays queued and retries without sending anoth
     router.stop();
   }
 });
+
+test('a failed alert waits twice as long after each attempt, holds no other phone back and is sent once', async () => {
+  let now = 0;
+  let down = true;
+  const attempts: number[] = [];
+  const sent: string[] = [];
+  const router = new AttentionDelivery({
+    now: () => now,
+    policy: () => DEFAULT_NOTIFICATION_POLICY,
+    current: () => ({
+      status: 'attention',
+      approvalIds: ['ask'],
+      activeChildren: false,
+      updatedAt: '',
+    }),
+    deliver: async (pairing) => {
+      if (pairing === 'first') {
+        attempts.push(now);
+        if (down) throw new Error('API unavailable');
+      }
+      sent.push(pairing);
+    },
+    report: () => {},
+  });
+  const ask = (pairing: string) =>
+    router.push(pairing, {
+      type: 'attention',
+      projectId: 'project',
+      threadId: 'thread',
+      title: '',
+      body: '',
+      reason: 'approval',
+      approvalId: 'ask',
+    });
+  try {
+    await ask('first');
+    await ask('second');
+    now = 1_500;
+    await assert.rejects(router.flush(), /API unavailable/);
+    await router.flush();
+    assert.deepEqual(sent, ['second']);
+    for (const wait of [2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000]) {
+      now += wait - 1;
+      await router.flush();
+      now += 1;
+      await assert.rejects(router.flush(), /API unavailable/);
+    }
+    assert.deepEqual(attempts, [1_500, 3_500, 7_500, 15_500, 31_500, 63_500, 123_500, 183_500]);
+    // A repeated ask for the same request keeps its wait.
+    await ask('first');
+    now += 60_000;
+    await assert.rejects(router.flush(), /API unavailable/);
+    now += 59_999;
+    await router.flush();
+    assert.equal(attempts.length, 9);
+    down = false;
+    now += 1;
+    await router.flush();
+    now += 600_000;
+    await router.flush();
+    assert.deepEqual(sent, ['second', 'first']);
+    assert.equal(attempts.length, 10);
+  } finally {
+    router.stop();
+  }
+});

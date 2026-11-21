@@ -7,18 +7,21 @@ export type { NotificationPolicy } from './attention';
 // Product and wire version
 // =============================================================================
 
-// `storeProduct` is the subscription's product id in both the App Store and Google Play.
+// Each plan's `id` is its subscription's product id in both the App Store and Google Play. In the
+// App Store both sit at one level of one subscription group, with the same free trial.
 export const PRODUCT = {
-  name         : 'Dashup',
-  shorthand    : '-up',
-  app          : 'com.dashup.mobile',
-  site         : 'https://dashup.com',
-  api          : 'https://api.dashup.com',
-  support      : 'support@dashup.com',
-  currency     : 'USD',
-  trialDays    : 14,
-  monthlyPrice : 10,
-  storeProduct : 'dashup.monthly',
+  name      : 'Dashup',
+  shorthand : '-up',
+  app       : 'com.dashup.mobile',
+  site      : 'https://dashup.com',
+  api       : 'https://api.dashup.com',
+  support   : 'support@dashup.com',
+  currency  : 'USD',
+  trialDays : 14,
+  plans     : {
+    monthly : { id: 'dashup.monthly', price: 10, period: 'month' },
+    yearly  : { id: 'dashup.yearly', price: 96, period: 'year' },
+  },
 } as const;
 
 export const PAIRING_TTL_MS     = 5 * 60_000;
@@ -27,6 +30,16 @@ export const PROTOCOL_VERSION   = 1;
 // =============================================================================
 // Billing
 // =============================================================================
+
+export type Plan = keyof typeof PRODUCT.plans;
+
+// The order plans are offered in.
+export const PLANS = Object.keys(PRODUCT.plans) as Plan[];
+
+// Whole months of the monthly plan a year of the yearly one leaves out.
+export const YEARLY_FREE_MONTHS = Math.floor(
+  12 - PRODUCT.plans.yearly.price / PRODUCT.plans.monthly.price,
+);
 
 // Stripe, the App Store and Google Play each own the subscriptions they bill; `subscription` is
 // the account's one that has not ended. Only a first subscription gets Stripe's free trial, while
@@ -42,6 +55,20 @@ export type BillingStatus = {
     cancelAt  : string | null;
   } | null;
 };
+
+// Whether a subscription in each state has Dashup Cloud, whichever its plan. past_due is a renewal
+// its provider still retries with access: Stripe's retries, and Apple's and Play's grace periods.
+const ENTITLED = {
+  active   : true,
+  trialing : true,
+  past_due : true,
+
+  paused   : false,
+  unpaid   : false,
+} as const satisfies Record<NonNullable<BillingStatus['subscription']>['status'], boolean>;
+
+export const subscribed = ({ subscription }: BillingStatus): boolean =>
+  !!subscription && ENTITLED[subscription.status] === true;
 
 // =============================================================================
 // Native conversation previews
@@ -307,6 +334,8 @@ export const STATE_EVENT = 'dashup:state';
 export type Dashboard = {
   updatedAt: string;
   version: string;
+  // The session version the computer speaks. One that names none speaks version 1.
+  session?: number;
   features: Array<'terminal' | 'workspace' | 'uploads' | 'attention'>;
   projects: ProjectOverview[];
   sessions: SessionOverview[];

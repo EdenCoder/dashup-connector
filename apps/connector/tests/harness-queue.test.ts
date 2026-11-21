@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { rmSync, statSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { rmSync, statSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 
 import type { QueueReceipt } from '@dashup/protocol';
 import { nativeProcesses } from '../src/harness/processes';
@@ -14,6 +14,7 @@ import {
   writerOwner,
   queueOwner,
   codexVersion,
+  queueDatabase,
   nativeReceipt,
   reconcileReceipt,
   type QueueOwner,
@@ -126,6 +127,45 @@ test(
     }
   },
 );
+
+test('the queue is offered from the first Codex known to take it, for as long as its databases answer receipt queries', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dashup-queue-format-'));
+  const change = (name: string, statement: string) => {
+    const database = new DatabaseSync(join(home, name));
+    database.exec(statement);
+    database.close();
+  };
+  try {
+    assert.equal(queueDatabase('0.166.0', home), undefined);
+    change(
+      'queue_1.sqlite',
+      'CREATE TABLE queued_items (id TEXT, thread_id TEXT, payload_json TEXT)',
+    );
+    const queue = realpathSync.native(join(home, 'queue_1.sqlite'));
+    for (const version of ['0.153.4', '0.165.0', '0.166.0', '1.2.0'])
+      assert.equal(queueDatabase(version, home)?.path, queue);
+    for (const version of ['0.153.3', '0.99.0', 'unknown'])
+      assert.equal(queueDatabase(version, home), undefined);
+    // Typed history, where a home has it, must answer its receipt queries too.
+    change(
+      'thread_history_1.sqlite',
+      `CREATE TABLE thread_items (thread_id TEXT, turn_id TEXT, item_id TEXT,
+        rollout_ordinal INTEGER, item_type TEXT, item_json TEXT)`,
+    );
+    assert.equal(queueDatabase('0.166.0', home)?.path, queue);
+    change(
+      'thread_history_1.sqlite',
+      'ALTER TABLE thread_items RENAME COLUMN rollout_ordinal TO position',
+    );
+    assert.equal(queueDatabase('0.166.0', home), undefined);
+    rmSync(join(home, 'thread_history_1.sqlite'));
+    assert.equal(queueDatabase('0.166.0', home)?.path, queue);
+    change('queue_1.sqlite', 'ALTER TABLE queued_items RENAME COLUMN payload_json TO payload');
+    assert.equal(queueDatabase('0.166.0', home), undefined);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
 
 test('native delivery requires typed client identity in the exact thread, followed by a same-turn assistant item', () => {
   const home = mkdtempSync(join(tmpdir(), 'dashup-queue-receipt-'));

@@ -28,30 +28,51 @@ export type HistorySession = {
   files       : string[];
   // Native history can exist while another process still owns the session.
   resumable?  : false;
-  read()      : Message[];
+  // The conversation its store keeps. One read in windows gives the newest, or the one holding
+  // `before`, with more than a phone's page before it unless the conversation starts within it.
+  read(before?: string) : Message[];
   settings?() : Settings;
   context?()  : ContextUsage | undefined;
   // A saved lifecycle marker needs a live writer before it describes present activity.
   status?()   : 'working' | 'idle' | undefined;
 };
 
-// A live session without a `title` leaves the one its saved history gives.
-export type LiveSession = {
+// A conversation's messages, oldest first, holding its newest or the one a page ends at; `more`
+// says earlier messages exist before the first.
+export type Page = { messages: Message[]; more: boolean };
+
+// A page read from another process is refused past these bounds.
+const PAGE_MESSAGES = 64;
+const PAGE_BYTES    = 2 * 1024 * 1024;
+
+export function bounded(page: Page): Page {
+  if (
+    page.messages.length > PAGE_MESSAGES ||
+    Buffer.byteLength(JSON.stringify(page.messages)) > PAGE_BYTES
+  )
+    throw new Error('The native conversation page exceeds its limit.');
+  return page;
+}
+
+// A live session without a `title` leaves the one its saved history gives. The connector's stored
+// receipt runs each request once, so `stop`, `send`, `approve` and `configure` act on every call;
+// `requestId` names the request to hosts that take a client id.
+export type LiveSession<H extends Harness = Harness> = {
   id         : string;
   cwd        : string;
   title?     : string;
-  harness    : Harness;
+  harness    : H;
   editor?    : Editor;
   updatedAt  : string;
   status     : ThreadSummary['status'];
-  messages   : Message[];
   // Null clears a previous report; undefined permits a saved native report before live usage arrives.
   context?   : ContextUsage | null;
   // The reply the agent is writing, as far as it has streamed, when its host reports one.
   typing?    : string;
   approvals  : Approval[];
-  // Native workbenches return one bounded page, including `before` when supplied.
-  readMessages? : (before?: string) => Promise<{ messages: Message[]; more: boolean }>;
+  // Read only when a phone opens the conversation: the whole list its host gives, or a native
+  // workbench's bounded page, which holds `before` when supplied.
+  readMessages? : (before?: string) => Promise<Page>;
   // Release selected native content when no paired phone is viewing this session.
   releaseMessages? : () => void;
   stop?      : (requestId: string) => Promise<void>;
@@ -92,6 +113,81 @@ export function agentHarness(name: string): Harness | undefined {
   if (/kimi/i.test(name)) return 'kimi';
   if (/opencode/i.test(name)) return 'opencode';
   return undefined;
+}
+
+// Whether integrations look for agents where each keeps its own records, sockets and processes.
+// Turned off, an integration reads only what a setting of its own names.
+export const liveDiscovery = (): boolean => process.env.DASHUP_LIVE_DISCOVERY !== '0';
+
+// One read at a time: a call made while one is under way takes its result.
+export function singleFlight<T>(read: () => Promise<T>): () => Promise<T> {
+  let reading: Promise<T> | undefined;
+  return () => (reading ??= read().finally(() => (reading = undefined)));
+}
+
+// A burst of native events is one change: `changed` hears of it once, a tenth of a second after
+// the first. `cancel` drops a change it has not heard of yet.
+export function debounced(changed: () => void): (() => void) & { cancel(): void } {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const soon = (): void => {
+    timer ??= setTimeout(() => {
+      timer = undefined;
+      changed();
+    }, 100).unref();
+  };
+  soon.cancel = (): void => {
+    clearTimeout(timer);
+    timer = undefined;
+  };
+  return soon;
+}
+
+// =============================================================================
+// Sessions Dashup hosts
+// =============================================================================
+
+// The title of a session Dashup starts: the first line of its first message.
+export const firstLine = (text: string): string => text.trim().split('\n')[0]!.slice(0, 80);
+
+// What a session Dashup hosts holds of its conversation, which its agent's own history keeps: the
+// messages of a turn under way, and after it only while a phone reads them.
+export class HostedConversation {
+  readonly messages: Message[] = [];
+  private followed = false;
+
+  constructor(private readonly running: () => boolean) {}
+
+  // A phone that reads the conversation holds it until it lets go.
+  readonly read = async (): Promise<Page> => {
+    this.followed = true;
+    return { messages: [...this.messages], more: false };
+  };
+
+  readonly release = (): void => {
+    this.followed = false;
+    this.ended();
+  };
+
+  ended(): void {
+    if (!this.running() && !this.followed) this.messages.length = 0;
+  }
+}
+
+// Hands a session its message. Nothing runs between turns, so a session that could not take its
+// first message is forgotten.
+export async function hand<S extends { readonly id: string }>(
+  sessions: Map<string, S>,
+  session: S,
+  say: () => Promise<void>,
+): Promise<void> {
+  const known = sessions.has(session.id);
+  sessions.set(session.id, session);
+  try {
+    await say();
+  } catch (error) {
+    if (!known) sessions.delete(session.id);
+    throw error;
+  }
 }
 
 // =============================================================================

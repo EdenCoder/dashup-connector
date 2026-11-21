@@ -1,16 +1,15 @@
 import { homedir } from 'node:os';
 import { promisify } from 'node:util';
-import { constants } from 'node:fs';
 import { join, isAbsolute } from 'node:path';
 import { execFile } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
-import { open, lstat, stat } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 
 import WebSocket from 'ws';
 import type { Message, Approval, ApprovalReply } from '@dashup/protocol';
 
-import { privateRecord } from './local-file';
-import { toolInput, MAX_PREVIEW, NO_PREVIEW, type LiveSession } from './session';
+import { text, loopbackOrigin } from './local-http';
+import { readRecord, ownProcess, MAX_RECORD, privateRecord } from './local-file';
+import { bounded, toolInput, MAX_PREVIEW, NO_PREVIEW, singleFlight, liveDiscovery, type Page, type LiveSession } from './session';
 
 // =============================================================================
 // Existing T3 Code environments (published v0.1.5 HTTP / Effect RPC protocol 2)
@@ -20,82 +19,38 @@ const PROTOCOL      = '2';
 const REQUEST_MS    = 4_000;
 const AUTH_MS       = 10_000;
 const SELECTED_MS   = 350;
-const MAX_RECORD    = 64 * 1024;
 const MAX_BYTES     = 2 * 1024 * 1024;
 const MAX_SESSIONS  = 100;
 const MAX_ITEMS     = 600;
 const PAGE_ITEMS    = 30;
-const MAX_OPERATIONS = 1_000;
 const AUTH_TTL      = '10m';
 
 type Data = Record<string, any>;
 type Owner = { base: string; origin: string; pid: number; startedAt: string };
 type Credential = { token: string; expiresAt: number };
-type Page = { messages: Message[]; more: boolean };
 
-export function t3Origin(value: string): string {
-  const url = new URL(value);
-  if (
-    url.protocol !== 'http:' ||
-    !['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname) ||
-    url.username ||
-    url.password ||
-    url.pathname !== '/' ||
-    url.search ||
-    url.hash
-  )
-    throw new Error('T3 Code discovery requires an uncredentialed loopback HTTP origin');
-  if (url.hostname === 'localhost') url.hostname = '127.0.0.1';
-  return url.origin;
-}
+export const t3Origin = (value: string): string =>
+  loopbackOrigin(value, 'T3 Code discovery requires an uncredentialed loopback HTTP origin');
 
 async function owner(): Promise<Owner | undefined> {
   const explicit = process.env.DASHUP_T3_BASE_DIR?.trim();
-  if (process.env.DASHUP_LIVE_DISCOVERY === '0' && !explicit) return;
+  if (!liveDiscovery() && !explicit) return;
   const base = explicit || process.env.T3CODE_HOME?.trim() || join(homedir(), '.t3');
   if (!isAbsolute(base)) return;
-  const path = join(base, 'userdata', 'server-runtime.json');
-  const info = await lstat(path).catch(() => undefined);
   // Native runtime metadata contains no credential and may be readable by other local users.
+  const value = await readRecord(join(base, 'userdata', 'server-runtime.json'), true);
   if (
-    !info?.isFile() ||
-    info.isSymbolicLink() ||
-    info.size > MAX_RECORD ||
-    (process.getuid && (info.uid !== process.getuid() || (info.mode & 0o022) !== 0))
+    value?.version !== 1 ||
+    !Number.isSafeInteger(value.pid) ||
+    value.pid <= 0 ||
+    typeof value.origin !== 'string' ||
+    typeof value.startedAt !== 'string' ||
+    !Number.isFinite(Date.parse(value.startedAt))
   )
     return;
-  const file = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-  try {
-    const checked = await file.stat();
-    if (
-      !checked.isFile() ||
-      checked.size > MAX_RECORD ||
-      (process.getuid && (checked.uid !== process.getuid() || (checked.mode & 0o022) !== 0))
-    )
-      return;
-    const value = JSON.parse(await file.readFile('utf8'));
-    if (
-      value?.version !== 1 ||
-      !Number.isSafeInteger(value.pid) ||
-      value.pid <= 0 ||
-      typeof value.origin !== 'string' ||
-      typeof value.startedAt !== 'string' ||
-      !Number.isFinite(Date.parse(value.startedAt))
-    )
-      return;
-    const origin = t3Origin(value.origin);
-    if (Number(new URL(origin).port || 80) !== value.port) return;
-    process.kill(value.pid, 0);
-    if (
-      process.platform === 'linux' &&
-      process.getuid &&
-      (await stat(`/proc/${value.pid}`)).uid !== process.getuid()
-    )
-      return;
-    return { base, origin, pid: value.pid, startedAt: value.startedAt };
-  } finally {
-    await file.close();
-  }
+  const origin = t3Origin(value.origin);
+  if (Number(new URL(origin).port || 80) !== value.port || !(await ownProcess(value.pid))) return;
+  return { base, origin, pid: value.pid, startedAt: value.startedAt };
 }
 
 function credential(value: Data): Credential {
@@ -115,22 +70,11 @@ async function authorize(native: Owner, signal: AbortSignal): Promise<Credential
   if (path) {
     if (!(await privateRecord(path, MAX_RECORD)))
       throw new Error('T3 Code credential file must be private to this user');
-    const file = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-    try {
-      const info = await file.stat();
-      if (
-        !info.isFile() ||
-        info.size > MAX_RECORD ||
-        (process.getuid && (info.uid !== process.getuid() || (info.mode & 0o077) !== 0))
-      )
-        throw new Error('T3 Code credential file changed');
-      const value = JSON.parse(await file.readFile('utf8'));
-      if (value.origin !== native.origin)
-        throw new Error('T3 Code credential belongs to another environment');
-      return credential(value);
-    } finally {
-      await file.close();
-    }
+    const value = await readRecord(path);
+    if (value === undefined) throw new Error('T3 Code credential file changed');
+    if (value.origin !== native.origin)
+      throw new Error('T3 Code credential belongs to another environment');
+    return credential(value);
   }
   // The official auth subcommand opens the existing local auth store; it never launches a server.
   const { stdout } = await promisify(execFile)(
@@ -163,21 +107,9 @@ async function read(native: Owner, auth: Credential, path: string): Promise<Data
     signal: AbortSignal.timeout(REQUEST_MS),
   });
   if (!response.ok || !response.body) throw new Error('T3 Code refused the request');
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let bytes = 0;
-  try {
-    for (;;) {
-      const next = await reader.read();
-      if (next.done) break;
-      bytes += next.value.byteLength;
-      if (bytes > MAX_BYTES) throw new Error('T3 Code response exceeds the page limit');
-      chunks.push(next.value);
-    }
-  } finally {
-    await reader.cancel().catch(() => {});
-  }
-  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  return JSON.parse(
+    await text(response.body, MAX_BYTES, 'T3 Code response exceeds the page limit'),
+  );
 }
 
 function dispatch(native: Owner, auth: Credential, command: Data): Promise<void> {
@@ -322,14 +254,13 @@ function nativeApprovals(projection: Data): Approval[] {
 }
 
 class Conversation {
-  readonly live: LiveSession;
+  readonly live: LiveSession<'t3'>;
   private activeRunId?: string;
   private page: Page = { messages: [], more: false };
   private cursor?: string;
   private readonly historyOrigins = new Map<string, string>();
   private selected?: ReturnType<typeof setTimeout>;
   private generation = 0;
-  private readonly operations = new Map<string, { hash: string; promise: Promise<void> }>();
   private disposed = false;
 
   constructor(
@@ -345,9 +276,8 @@ class Conversation {
       harness: 't3',
       updatedAt: new Date(0).toISOString(),
       status: 'idle',
-      messages: [],
       approvals: [],
-      readMessages: (before) => this.read(before),
+      readMessages: (before) => this.read(before).then(bounded),
       releaseMessages: () => this.release(),
       send: (requestId, text, _now, files) => {
         if (files?.length) throw new Error('Add T3 Code attachments on your computer');
@@ -450,26 +380,14 @@ class Conversation {
     };
   }
 
-  private mutate(requestId: string, fields: Data): Promise<void> {
-    if (this.disposed) return Promise.reject(new Error('T3 Code session is no longer available'));
-    const hash = createHash('sha256').update(JSON.stringify(fields)).digest('hex');
-    const prior = this.operations.get(requestId);
-    if (prior)
-      return prior.hash === hash
-        ? prior.promise
-        : Promise.reject(new Error('T3 Code request id was already used for another action'));
-    if (this.operations.size >= MAX_OPERATIONS)
-      return Promise.reject(new Error('Reconnect T3 Code before sending more requests'));
-    const promise = (async () => {
-      await dispatch(this.native, await this.auth(), {
-        ...fields,
-        commandId: `dashup-${requestId}`,
-        threadId: this.live.id,
-      });
-      this.changed();
-    })();
-    this.operations.set(requestId, { hash, promise });
-    return promise;
+  private async mutate(requestId: string, fields: Data): Promise<void> {
+    if (this.disposed) throw new Error('T3 Code session is no longer available');
+    await dispatch(this.native, await this.auth(), {
+      ...fields,
+      commandId: `dashup-${requestId}`,
+      threadId: this.live.id,
+    });
+    this.changed();
   }
 
   private approve(requestId: string, id: string, reply: ApprovalReply): Promise<void> {
@@ -508,6 +426,7 @@ class Conversation {
 // =============================================================================
 
 export class T3 {
+  readonly harness = 't3';
   private runtime?: Owner;
   private credential?: Credential;
   private authorizing?: Promise<Credential>;
@@ -515,7 +434,7 @@ export class T3 {
   private generation = 0;
   private readonly conversations = new Map<string, Conversation>();
   private stopped = false;
-  private refreshing?: Promise<LiveSession[]>;
+  private readonly discovering = singleFlight(() => this.discover());
 
   constructor(private readonly changed: () => void) {}
 
@@ -542,20 +461,11 @@ export class T3 {
     return pending;
   }
 
-  refresh(): Promise<LiveSession[]> {
-    if (this.stopped) return Promise.resolve([]);
-    if (this.refreshing) return this.refreshing;
-    const pending = this.discover();
-    this.refreshing = pending;
-    void pending
-      .finally(() => {
-        if (this.refreshing === pending) this.refreshing = undefined;
-      })
-      .catch(() => {});
-    return pending;
+  refresh(): Promise<LiveSession<'t3'>[]> {
+    return this.stopped ? Promise.resolve([]) : this.discovering();
   }
 
-  private async discover(): Promise<LiveSession[]> {
+  private async discover(): Promise<LiveSession<'t3'>[]> {
     if (this.stopped) return [];
     const native = await owner().catch(() => undefined);
     if (this.stopped) return [];
@@ -602,9 +512,15 @@ export class T3 {
         }
       return [...this.conversations.values()].map((conversation) => conversation.live);
     } catch {
-      this.clear();
+      // The scoped session is issued again only once it expires or the environment changes.
+      this.release();
       return [];
     }
+  }
+
+  private release(): void {
+    for (const conversation of this.conversations.values()) conversation.stop();
+    this.conversations.clear();
   }
 
   private clear(): void {
@@ -612,8 +528,7 @@ export class T3 {
     this.authAbort?.abort();
     this.authAbort = undefined;
     this.authorizing = undefined;
-    for (const conversation of this.conversations.values()) conversation.stop();
-    this.conversations.clear();
+    this.release();
     this.runtime = undefined;
     this.credential = undefined;
   }

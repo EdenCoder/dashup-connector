@@ -172,7 +172,11 @@ test('a temporary meter failure preserves an advertised reset while a provider r
 });
 
 test('computers that share a login name one reset alike, without the account or its time', () => {
-  const shared = (at = RESET, identity = 'vendor-account-id', harness: Usage['harness'] = 'claude') => ({
+  const shared = (
+    at = RESET,
+    identity = 'vendor-account-id',
+    harness: Usage['harness'] = 'claude',
+  ) => ({
     ...login([window(10_080, 40, at)], 'person@example.com', harness),
     identity,
   });

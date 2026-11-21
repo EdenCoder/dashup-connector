@@ -13,6 +13,8 @@ import type { StoredAttention } from './attention';
 interface LocalPair {
   key      : string;
   sequence : number;
+  // The session version the pairing's phone speaks. One that names none speaks version 1.
+  session? : number;
   attention? : NotificationPolicy;
 }
 

@@ -1,7 +1,7 @@
 import { join, basename, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
-import { mkdir, lstat, realpath, open } from 'node:fs/promises';
+import { rm, open, mkdir, lstat, lutimes, readdir, realpath } from 'node:fs/promises';
 import { MAX_ATTACHMENT_BYTES, ATTACHMENT_NAME_CHARS, type Attachment, type PairingRecord } from '@dashup/protocol';
 import { openAttachment } from '@dashup/protocol/crypto';
 import { configPath, type ConnectorConfig } from './config';
@@ -12,14 +12,22 @@ import type { InputFile } from './harness/session';
 // =============================================================================
 
 const DOWNLOAD_MS = 30_000;
+// An agent reads an upload in the turn it was sent for or queued behind; a day outlasts both.
+const KEEP_MS     = 24 * 60 * 60_000;
+const UPLOADS     = 'uploads';
 
 export type UploadedPrompt = { text: string; files: InputFile[] };
+
+// Beside the state file, the uploads folder holds a folder per pairing, and in it one per upload,
+// whose time says when the phone last sent it.
+const pairingFolder = (pairing: string): string =>
+  createHash('sha256').update(pairing).digest('hex');
 
 async function folder(pairing: string, id: string): Promise<string> {
   const home = dirname(configPath());
   await mkdir(home, { recursive: true, mode: 0o700 });
   let current = await realpath(home);
-  for (const part of ['uploads', createHash('sha256').update(pairing).digest('hex'), id]) {
+  for (const part of [UPLOADS, pairingFolder(pairing), id]) {
     current = join(current, part);
     await mkdir(current, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
       if (error.code !== 'EEXIST') throw error;
@@ -30,6 +38,8 @@ async function folder(pairing: string, id: string): Promise<string> {
     if (process.platform !== 'win32' && (stat.mode & 0o077) !== 0)
       throw new Error('The upload folder must only be accessible to your operating-system user.');
   }
+  const now = new Date();
+  await lutimes(current, now, now);
   return current;
 }
 
@@ -125,4 +135,58 @@ export async function receiveUploads(
     text: `${text}\n\nFiles attached from my phone are available on this computer. Read these files as context for my message:\n${files.map((file) => JSON.stringify(file.path)).join('\n')}`,
     files,
   };
+}
+
+// =============================================================================
+// Removing them
+// =============================================================================
+
+const missing = (error: unknown) => (error as NodeJS.ErrnoException).code === 'ENOENT';
+
+// The uploads folder, when it is a real folder beside the state file.
+async function uploads(): Promise<string | undefined> {
+  try {
+    const path = join(await realpath(dirname(configPath())), UPLOADS);
+    return (await lstat(path)).isDirectory() ? path : undefined;
+  } catch (error) {
+    if (missing(error)) return undefined;
+    throw error;
+  }
+}
+
+// The real folders in one; a link is never listed.
+async function folders(path: string): Promise<string[]> {
+  const entries = await readdir(path, { withFileTypes: true }).catch((error: unknown) => {
+    if (missing(error)) return [];
+    throw error;
+  });
+  return entries.filter((entry) => entry.isDirectory()).map((entry) => join(path, entry.name));
+}
+
+// Removes a folder in the uploads folder, if last sent before `before`, only once it resolves to
+// itself, so no link on its way leads out; `rm` removes a link inside it, never what it names.
+async function remove(path: string, before = Infinity): Promise<void> {
+  try {
+    const stat = await lstat(path);
+    if (!stat.isDirectory() || stat.mtimeMs >= before || (await realpath(path)) !== path) return;
+  } catch (error) {
+    if (missing(error)) return;
+    throw error;
+  }
+  await rm(path, { recursive: true, force: true });
+}
+
+// A revoked pairing's uploads go with it.
+export async function forgetUploads(pairing: string): Promise<void> {
+  const root = await uploads();
+  if (root) await remove(join(root, pairingFolder(pairing)));
+}
+
+// Each upload goes a day after the phone last sent it.
+export async function expireUploads(): Promise<void> {
+  const root = await uploads();
+  if (!root) return;
+  const before = Date.now() - KEEP_MS;
+  for (const pairing of await folders(root))
+    for (const upload of await folders(pairing)) await remove(upload, before);
 }

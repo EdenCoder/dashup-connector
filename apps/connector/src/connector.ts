@@ -6,7 +6,7 @@ import type { Duplex } from 'node:stream';
 import { createClient } from '@parcae/sdk';
 import { HARNESSES, isStartHarness, PAIRING_TTL_MS, START_HARNESSES, DASHBOARD_BYTES, STATE_EVENT } from '@dashup/protocol';
 import { seal, newSecret } from '@dashup/protocol/crypto';
-import { SESSION_JOIN, SESSION_READY, SESSION_PACKET, SESSION_PEER, SESSION_STREAM_BYTES, sealSession, openSession } from '@dashup/protocol/session';
+import { SESSION_JOIN, SESSION_READY, SESSION_PACKET, SESSION_PEER, SESSION_VERSION, SESSION_STREAMS, SESSION_STREAM_BYTES, sealSession, openSession, opensHello, sealLegacySession, openLegacySession } from '@dashup/protocol/session';
 import type { SessionContent as Content, SessionCommand, SessionResult, SessionPacket, SessionReady, SessionPeer } from '@dashup/protocol/session';
 import type { Message, Approval, QueueReceipt, StartHarness, ApprovalReply, CommandAction, PairingRecord, ThreadSummary, ProjectSummary, ProjectOverview, Dashboard, Envelope, State, StateEvent, Harness } from '@dashup/protocol';
 import { parseNotificationPolicy, DEFAULT_NOTIFICATION_POLICY } from '@dashup/protocol/attention';
@@ -16,9 +16,9 @@ import { version } from '../package.json';
 import { planUsage, type Login } from './usage';
 import { usageResetEvents, validUsageReset, type UsageResetEvent } from './resets';
 import { Terminals } from './terminal';
-import { receiveUploads } from './uploads';
+import { forgetUploads, expireUploads, receiveUploads } from './uploads';
 import { Workspaces } from './workspace';
-import { AttentionDelivery, storeAttention, restoreAttention } from './attention';
+import { alertThread, storeAttention, restoreAttention, AttentionDelivery } from './attention';
 import { invitation, type Invitation } from './pair';
 import { Discovery } from './discovery';
 import { shareAttachment, opaque } from './attachments';
@@ -26,7 +26,7 @@ import { chatPage, chatPosition, historyMessageId } from './chat';
 import { GROUP_MEMBERS } from '@dashup/protocol/group';
 import { PhoneTools } from './phone';
 import { LiveHarnesses } from './harness/live';
-import type { InputFile, LiveSession } from './harness/session';
+import { sessionKey, type InputFile, type LiveSession } from './harness/session';
 import { NativeQueue, queueOwner, writerOwner } from './harness/queue';
 import { bridgeAcp, commandAcp, type AcpSession } from './acp';
 import { api, activePair, saveConfig, type ConnectorConfig } from './config';
@@ -47,6 +47,7 @@ const SELECTED_MS     = 120;
 const JOIN_MS         = 5_000;
 const HEARTBEAT_MS    = 30_000;
 const USAGE_MS        = 5 * 60_000;
+const AGENTS_MS       = 5 * 60_000;
 type Attention = import('./attention').ThreadAttentionEvent;
 type ThreadState = Extract<Content, { type: 'thread-state' }>;
 type Started = NonNullable<SessionResult['started']>;
@@ -282,12 +283,15 @@ export class Connector {
   private startable: StartHarness[] = [];
   private usage: Login[] = [];
   private usageAt = 0;
+  private agentsAt = 0;
   private usageReady = false;
   private stream = '';
   private sequence = 0;
   private readonly ready = new Set<string>();
   private readonly joining = new Map<string, ReturnType<typeof setTimeout>>();
-  private readonly received = new Map<string, { stream: string; sequence: number }>();
+  // Each pairing's phone streams met under this computer's streams, with the highest sequence taken
+  // from each. `stream` is the phone's current one; a packet from any other met stream is refused.
+  private readonly phones = new Map<string, { stream: string; seen: Map<string, number> }>();
   private readonly selected = new Map<string, Selected>();
   private readonly attachmentOrigins = new Map<
     string,
@@ -306,6 +310,8 @@ export class Connector {
   private readonly currentAttention = new Map<string, { event: Attention; updatedAt: string }>();
   private readonly queueReceipts = new Map<string, string>();
   private readonly invitations = new Map<string, string>();
+  // Pairings this computer asked the API to revoke, each asked once.
+  private readonly revoked = new Set<string>();
   private readonly dashboardText = new Map<string, string>();
   private readonly dashboards = new Map<string, Envelope>();
   private readonly publishing = new Set<string>();
@@ -335,7 +341,11 @@ export class Connector {
       getToken: async () => config.secret,
       autoConnect: false,
     });
-    this.discovery = new Discovery(config.device.id, config.localSecret);
+    this.discovery = new Discovery(config.device.id, config.localSecret, {
+      queue: (history) => Boolean(queueOwner(this.nativeQueue.owners, history)),
+      writer: (history) => Boolean(writerOwner(this.nativeQueue.writers, history)),
+      starts: (harness) => isStartHarness(harness) && this.startable.includes(harness),
+    });
     this.nativeQueue = new NativeQueue(
       config.queued,
       () => saveConfig(config),
@@ -448,20 +458,14 @@ export class Connector {
 
   async start(): Promise<void> {
     this.client.subscribe(STATE_EVENT, (event: StateEvent) => {
-      if (event.type === 'pairing')
-        this.acceptPairings([
-          ...this.pairRecords.filter((pair) => pair.id !== event.pairing.id),
-          event.pairing,
-        ]);
+      if (event.type === 'pairing') this.accept(event.pairing);
       if (event.type !== 'dashboard') void this.refreshState().catch((error) => this.report(error));
     });
     this.client.on('disconnected', () => {
-      this.phone.disconnect();
       this.stream = '';
       this.ready.clear();
       this.joining.clear();
-      this.clearSelected();
-      this.terminals.disconnect();
+      this.dropPhone();
     });
     this.client.subscribe(SESSION_READY, (value: SessionReady) => {
       if (value.device !== this.config.device!.id || value.stream !== this.stream) return;
@@ -470,27 +474,24 @@ export class Connector {
         this.ready.add(value.pairing);
         void this.publishQueueReceipts(value.pairing);
       } else {
-        this.phone.disconnect(value.pairing);
         this.ready.delete(value.pairing);
-        this.clearSelected(value.pairing);
-        this.terminals.disconnect(value.pairing);
+        this.dropPhone(value.pairing);
         this.report(new Error(value.error ?? 'The session connection is unavailable.'));
       }
     });
+    // The relay's word about the phone is unauthenticated. It can end what this computer pushes to
+    // a phone that left; only a version 1 phone's new stream is taken on it.
     this.client.subscribe(SESSION_PEER, (peer: SessionPeer) => {
       const pair = this.activePairs().find(
         (item) => item.id === peer.pairing && item.mobile === peer.device,
       );
-      const prior = this.received.get(peer.pairing);
-      if (!pair || (!peer.connected && prior && prior.stream !== peer.stream)) return;
-      if (!peer.connected || prior?.stream !== peer.stream) {
-        this.phone.disconnect(pair.id);
-        this.clearSelected(pair.id);
-        this.terminals.disconnect(pair.id);
-      }
-      if (peer.connected && prior?.stream !== peer.stream) {
-        this.received.set(pair.id, { stream: peer.stream, sequence: 0 });
+      const current = this.phones.get(peer.pairing)?.stream;
+      if (!pair || (!peer.connected && current && current !== peer.stream)) return;
+      if (!peer.connected || current !== peer.stream) this.dropPhone(pair.id);
+      if (peer.connected && current !== peer.stream && this.legacy(pair.id)) {
+        this.admit(pair.id, peer.stream, 0);
         void this.publishQueueReceipts(pair.id);
+        this.rotate(pair.id);
       }
     });
     this.client.subscribe(SESSION_PACKET, (packet: SessionPacket) => {
@@ -498,21 +499,15 @@ export class Connector {
     });
     this.client.on('resync-required', () => {
       // Custom socket events need the completed hello; transport connection alone is not enough.
-      this.stream = randomBytes(SESSION_STREAM_BYTES).toString('hex');
-      this.sequence = 0;
-      this.ready.clear();
-      this.joining.clear();
       this.client.send('dashup:presence', { device: this.config.device!.id });
-      this.joinSessions();
+      this.restream();
       void this.refreshState().catch((error) => this.report(error));
     });
     this.client.on('error', () =>
       this.report(new Error('Connection interrupted. Dashup will reconnect.')));
     await this.refreshState();
     await this.changed();
-    void this.findAgents()
-      .then(() => this.refreshOverview())
-      .catch((error) => this.report(error));
+    void this.findAgents().catch((error) => this.report(error));
     this.stopHarnesses = this.harnesses.watch(() => {
       this.scheduleSelected(true);
       this.scheduleCatalogue();
@@ -522,6 +517,8 @@ export class Connector {
       if (this.client.isConnected)
         this.client.send('dashup:presence', { device: this.config.device!.id });
       this.joinSessions();
+      void this.findAgents().catch((error) => this.report(error));
+      expireUploads().catch((error) => this.report(error));
     }, HEARTBEAT_MS);
     this.heartbeat.unref();
     this.refreshOverview();
@@ -540,6 +537,13 @@ export class Connector {
     return this.stateLoading;
   }
 
+  // One pairing as the API reports it, from its own event or to whoever saw the scan first.
+  accept(pairing: PairingRecord): void {
+    this.acceptPairings([...this.pairRecords.filter((pair) => pair.id !== pairing.id), pairing]);
+  }
+
+  // A pairing made from a code this computer no longer holds, because it expired or the connector
+  // restarted, has a key no one here kept, so the computer revokes it.
   private acceptPairings(records: PairingRecord[]): void {
     this.pairRecords = records.filter((pair) => pair.device === this.config.device!.id);
     for (const pair of this.activePairs()) {
@@ -547,6 +551,10 @@ export class Connector {
       if (key) {
         this.invitations.delete(pair.code);
         this.config.pairs[pair.id] = { key, sequence: 0 };
+      } else if (!this.config.pairs[pair.id] && !this.revoked.has(pair.id)) {
+        this.revoked.add(pair.id);
+        api(this.config, `/dashup/pairings/${pair.id}`, undefined, 'DELETE').catch((error) =>
+          this.report(error));
       }
     }
     const known = new Set(this.activePairs().map((pair) => pair.id));
@@ -557,7 +565,9 @@ export class Connector {
         this.notifications.cancel(id);
         this.clearSelected(id);
         this.ready.delete(id);
+        this.phones.delete(id);
         this.dashboards.delete(id);
+        forgetUploads(id).catch((error) => this.report(error));
         delete this.config.pairs[id];
       }
     for (const [id, receipt] of Object.entries(this.config.receipts!))
@@ -594,24 +604,81 @@ export class Connector {
       }
   }
 
+  // This computer's stream for the connection. Nothing sealed to an earlier one opens, so every
+  // pairing joins again on it.
+  private restream(): void {
+    this.stream = randomBytes(SESSION_STREAM_BYTES).toString('hex');
+    this.sequence = 0;
+    this.ready.clear();
+    this.joining.clear();
+    this.joinSessions();
+  }
+
+  // Whether the pairing's phone has yet to speak session version 2. Once it has, it is held to it.
+  private legacy(id: string): boolean {
+    return this.config.pairs[id]?.session !== SESSION_VERSION;
+  }
+
+  // The phone's first version 2 packet: from here its version 1 packets, and what the relay said of
+  // its streams, count for nothing.
+  private upgrade(id: string): void {
+    if (!this.legacy(id)) return;
+    this.config.pairs[id]!.session = SESSION_VERSION;
+    this.phones.delete(id);
+    saveConfig(this.config);
+  }
+
+  // Records a packet's place in its phone stream. A stream first met becomes the phone's current one.
+  private admit(id: string, stream: string, sequence: number): boolean {
+    const phone = this.phones.get(id) ?? { stream: '', seen: new Map<string, number>() };
+    const fresh = phone.stream !== stream;
+    phone.stream = stream;
+    phone.seen.set(stream, sequence);
+    this.phones.set(id, phone);
+    return fresh;
+  }
+
+  // Forgetting a met stream would let its packets back in. Past the bound this computer takes a new
+  // stream instead, which nothing sealed to the old one can follow.
+  private rotate(id: string): void {
+    const phone = this.phones.get(id);
+    if (!phone || phone.seen.size <= SESSION_STREAMS) return;
+    phone.seen = new Map([[phone.stream, phone.seen.get(phone.stream)!]]);
+    if (this.stream) this.restream();
+  }
+
+  // What this computer pushes to a phone ends with the phone's stream.
+  private dropPhone(id?: string): void {
+    this.phone.disconnect(id);
+    this.clearSelected(id);
+    this.terminals.disconnect(id);
+  }
+
+  // Whether the phone can be sent to: this computer's join stands and, for a version 2 phone, the
+  // stream it holds is known.
+  private linked(id: string): boolean {
+    return this.isActive(id) && this.ready.has(id) && (this.legacy(id) || this.phones.has(id));
+  }
+
+  // A version 2 packet is sealed to `peer`, the phone's stream.
+  private seal(pair: PairingRecord, content: Content, peer = ''): SessionPacket {
+    const key = this.config.pairs[pair.id]!.key;
+    const routing = {
+      pairing: pair.id,
+      sender: pair.device,
+      recipient: pair.mobile,
+      stream: this.stream,
+      sequence: ++this.sequence,
+    };
+    return this.legacy(pair.id)
+      ? sealLegacySession(key, routing, content, randomBytes)
+      : sealSession(key, routing, peer, content, randomBytes);
+  }
+
   private sendSession(pair: PairingRecord, content: Content): void {
-    if (!this.isActive(pair.id) || !this.ready.has(pair.id))
+    if (!this.linked(pair.id))
       throw new Error('This computer is not connected. Reopen the session.');
-    this.client.send(
-      SESSION_PACKET,
-      sealSession(
-        this.config.pairs[pair.id]!.key,
-        {
-          pairing: pair.id,
-          sender: pair.device,
-          recipient: pair.mobile,
-          stream: this.stream,
-          sequence: ++this.sequence,
-        },
-        content,
-        randomBytes,
-      ),
-    );
+    this.client.send(SESSION_PACKET, this.seal(pair, content, this.phones.get(pair.id)?.stream));
   }
 
   async send(pair: PairingRecord, content: Content): Promise<void> {
@@ -628,7 +695,7 @@ export class Connector {
       )
         return;
     }
-    if (this.isActive(pair.id) && this.ready.has(pair.id)) this.sendSession(pair, content);
+    if (this.linked(pair.id)) this.sendSession(pair, content);
   }
 
   private async receiveSession(packet: SessionPacket): Promise<void> {
@@ -644,9 +711,28 @@ export class Connector {
       packet.sequence < 1
     )
       return;
-    const prior = this.received.get(pair.id);
-    if (prior?.stream === packet.stream && packet.sequence <= prior.sequence) return;
-    const raw = openSession(this.config.pairs[pair.id]!.key, packet);
+    const key = this.config.pairs[pair.id]!.key;
+    const modern = packet.v === SESSION_VERSION;
+    const legacy = this.legacy(pair.id);
+    if (!modern && !legacy) return;
+    // What the relay said of a version 1 phone's streams does not judge its first version 2 packet.
+    const phone = modern && legacy ? undefined : this.phones.get(pair.id);
+    const last = phone?.seen.get(packet.stream);
+    if (last !== undefined && (packet.stream !== phone!.stream || packet.sequence <= last)) return;
+    let raw: Content;
+    if (modern) {
+      try {
+        raw = openSession(key, packet, this.stream);
+      } catch {
+        // Not sealed to this stream: a hello to answer, or a packet from before a reconnect.
+        if (opensHello(key, packet)) {
+          this.upgrade(pair.id);
+          this.client.send(SESSION_PACKET, this.seal(pair, { type: 'welcome' }, packet.stream));
+        }
+        return;
+      }
+      this.upgrade(pair.id);
+    } else raw = openLegacySession(key, packet);
     const content = (
       raw.type === 'phone.watch'
         ? z
@@ -659,12 +745,10 @@ export class Connector {
             ? Command.parse(raw)
             : Controls.parse(raw)
     ) as Content;
-    if (prior?.stream !== packet.stream) {
-      this.phone.disconnect(pair.id);
-      this.clearSelected(pair.id);
-      this.terminals.disconnect(pair.id);
+    if (this.admit(pair.id, packet.stream, packet.sequence)) {
+      this.dropPhone(pair.id);
+      void this.publishQueueReceipts(pair.id);
     }
-    this.received.set(pair.id, { stream: packet.stream, sequence: packet.sequence });
     try {
       if (content.type === 'phone.watch' || content.type === 'phone.response')
         return await this.phone.receive(pair.id, content);
@@ -698,12 +782,7 @@ export class Connector {
           live: this.discovery.locations.get(thread.id)?.live,
         };
         this.selected.set(key, selected);
-        if (
-          previous?.live &&
-          previous.live !== selected.live &&
-          ![...this.selected.values()].some((item) => item.live === previous.live)
-        )
-          previous.live.releaseMessages?.();
+        if (previous?.live && !this.followed(previous.live)) previous.live.releaseMessages?.();
         try {
           await this.sendPage(
             pair,
@@ -791,14 +870,22 @@ export class Connector {
         ...('threadId' in content ? { threadId: content.threadId } : {}),
         message: error instanceof Error ? error.message : 'Session operation failed.',
       });
+    } finally {
+      this.rotate(pair.id);
     }
+  }
+
+  // A selection follows a session through each listing of it that a refresh brings.
+  private followed(live: LiveSession): boolean {
+    return [...this.selected.values()].some(
+      (item) => !!item.live && sessionKey(item.live) === sessionKey(live),
+    );
   }
 
   private removeSelected(key: string): void {
     const live = this.selected.get(key)?.live;
     this.selected.delete(key);
-    if (live && ![...this.selected.values()].some((item) => item.live === live))
-      live.releaseMessages?.();
+    if (live && !this.followed(live)) live.releaseMessages?.();
   }
 
   private clearSelected(pairing?: string): void {
@@ -822,30 +909,18 @@ export class Connector {
       if (!key) return;
       const target = { project: selected.project, thread: thread.id, updatedAt: thread.updatedAt };
       const live = this.discovery.locations.get(thread.id)?.live;
-      if (selected.live !== live) {
-        const previous = selected.live;
-        selected.live = live;
-        if (previous && ![...this.selected.values()].some((item) => item.live === previous))
-          previous.releaseMessages?.();
-      }
-      const native = live?.readMessages
-        ? await live.readMessages(before ? chatPosition(key, target, before) : undefined)
-        : undefined;
+      const previous = selected.live;
+      selected.live = live;
+      if (previous && !this.followed(previous)) previous.releaseMessages?.();
+      const { messages, more } = await this.discovery.read(
+        thread,
+        before ? chatPosition(key, target, before) : undefined,
+      );
       if (
         this.selected.get(selectionKey(pair.id, selected.project, selected.thread)) !== selected ||
-        !this.isActive(pair.id) ||
-        !this.ready.has(pair.id)
+        !this.linked(pair.id)
       )
         return;
-      if (
-        native &&
-        (!Array.isArray(native.messages) ||
-          native.messages.length > 64 ||
-          Buffer.byteLength(JSON.stringify(native.messages)) > 2 * 1024 * 1024)
-      )
-        throw new Error('The native conversation page exceeds its limit.');
-      const messages =
-        native?.messages ?? this.discovery.read(thread, this.attached(thread)?.messages);
       const view = this.phoneMessages(pair, selected.project, selected.thread, messages);
       const page = chatPage(
         key,
@@ -854,7 +929,7 @@ export class Connector {
         before,
         requestId,
         live?.typing ?? '',
-        native?.more ?? false,
+        more,
         view.requests,
       );
       const encoded = JSON.stringify({ ...page, requestId: undefined });
@@ -917,7 +992,7 @@ export class Connector {
       await Promise.all(
         [...this.selected.values()].map(async (selected) => {
           const pair = this.activePairs().find((item) => item.id === selected.pairing);
-          if (!pair || !this.ready.has(pair.id)) return;
+          if (!pair || !this.linked(pair.id)) return;
           const project = this.discovery.projects.get(selected.project);
           const thread = project?.threads.find((item) => item.id === selected.thread);
           if (!project || !thread) return;
@@ -950,43 +1025,9 @@ export class Connector {
 
   private async refreshNative(harness: Harness): Promise<void> {
     const sessions = await this.harnesses.sessionsFor(harness);
-    this.retireNative(sessions, harness);
+    this.discovery.retire(sessions, harness);
     for (const session of sessions) this.observe(session);
-    this.refreshResumes();
     this.refreshOverview();
-  }
-
-  private retireNative(
-    sessions: import('./harness/session').LiveSession[],
-    harness?: Harness,
-  ): void {
-    const current = new Set(sessions.map((session) => `${session.harness}:${session.id}`));
-    for (const [id, location] of this.discovery.locations) {
-      const live = location.live;
-      if (
-        !live ||
-        (harness && live.harness !== harness) ||
-        current.has(`${live.harness}:${live.id}`)
-      )
-        continue;
-      location.live = undefined;
-      live.releaseMessages?.();
-      for (const project of this.discovery.projects.values()) {
-        const thread = project.threads.find((thread) => thread.id === id);
-        if (!thread) continue;
-        thread.status = 'unknown';
-        thread.capabilities = {
-          read: !!location.history,
-          send: false,
-          queue: false,
-          stop: false,
-          approve: false,
-          configure: false,
-        };
-        thread.options = undefined;
-        thread.step = undefined;
-      }
-    }
   }
 
   private observe(session: import('./harness/session').LiveSession): void {
@@ -1034,15 +1075,15 @@ export class Connector {
       if (this.stopped) return;
       this.lastCatalogue = Date.now();
       const current = [...(await this.harnesses.refresh()), ...this.terminals.list()];
-      this.retireNative(current);
+      this.discovery.retire(current);
       // Each thread the scan makes starts read-only, so nothing awaits until all have their controls.
       this.discovery.scan();
+      this.refreshQueues();
       for (const session of current) this.observe(session);
-      for (const agent of this.agents.values()) if (!agent.socket.destroyed) this.adopt(agent);
+      for (const agent of this.agents.values())
+        if (!agent.socket.destroyed) this.discovery.adopt(agent);
       for (const id of this.nativeSnapshots.keys())
         if (!this.discovery.locations.has(id)) this.nativeSnapshots.delete(id);
-      this.refreshQueues();
-      this.refreshResumes();
       this.refreshUsage();
       this.stopWatching();
       this.stopWatching = this.discovery.watch(() => {
@@ -1120,6 +1161,7 @@ export class Connector {
     const dashboard: Dashboard = {
       updatedAt: '',
       version,
+      session: SESSION_VERSION,
       features: ['terminal', 'workspace', 'uploads', 'attention'],
       projects: cards,
       sessions,
@@ -1213,9 +1255,13 @@ export class Connector {
     }
   }
 
+  // Agents get installed and update themselves while Dashup runs.
   private async findAgents(): Promise<void> {
+    if (Date.now() - this.agentsAt < AGENTS_MS) return;
+    this.agentsAt = Date.now();
     this.startable = await this.harnesses.agents();
-    this.refreshResumes();
+    this.discovery.refresh();
+    this.refreshOverview();
   }
   private refreshUsage(): void {
     if (Date.now() - this.usageAt < USAGE_MS) return;
@@ -1311,19 +1357,11 @@ export class Connector {
       .get(command.projectId)
       ?.threads.find((item) => item.id === command.threadId);
     if (!receipt || !thread) return;
-    const live = this.discovery.locations.get(thread.id)?.live;
     let messages: readonly Message[];
     try {
-      const page = live?.readMessages ? await live.readMessages() : undefined;
-      if (
-        page &&
-        (!Array.isArray(page.messages) ||
-          page.messages.length > 64 ||
-          Buffer.byteLength(JSON.stringify(page.messages)) > 2 * 1024 * 1024 ||
-          (!page.messages.length && page.more))
-      )
-        return;
-      messages = page?.messages ?? this.discovery.read(thread, this.attached(thread)?.messages);
+      const page = await this.discovery.read(thread);
+      if (!page.messages.length && page.more) return;
+      messages = page.messages;
     } catch {
       // An unreadable baseline cannot prove which later message belongs to this handoff.
       return;
@@ -1530,7 +1568,7 @@ export class Connector {
     for (const [requestId, pending] of Object.entries(this.config.queued!)) {
       if (reconnected && pending.pairing !== reconnected) continue;
       const pair = this.activePairs().find((item) => item.id === pending.pairing);
-      if (!pair || !activePair(this.config, pair) || !this.ready.has(pair.id)) continue;
+      if (!pair || !this.linked(pair.id)) continue;
       const queue = this.nativeQueue.reconcile(requestId);
       const encoded = JSON.stringify(queue);
       if (!reconnected && this.queueReceipts.get(requestId) === encoded) continue;
@@ -1539,6 +1577,7 @@ export class Connector {
     }
   }
 
+  // An alert that names no conversation is for the one `alertThread` picks in its project.
   async attention(
     projectId: string,
     threadId: string,
@@ -1547,20 +1586,26 @@ export class Connector {
     reason: Attention['reason'] = 'input',
     approvalId?: string,
   ): Promise<void> {
-    const thread = this.discovery.projects
-      .get(projectId)
-      ?.threads.find((thread) => thread.id === threadId);
-    if (!thread) throw new Error('Choose an existing project from dashup projects');
+    const threads = this.discovery.projects.get(projectId)?.threads;
+    const thread = threadId
+      ? threads?.find((thread) => thread.id === threadId)
+      : threads && alertThread(threads);
+    if (!thread)
+      throw new Error(
+        threads && !threadId
+          ? 'No conversation in this project is waiting for you. Name one with --thread to alert about it anyway.'
+          : 'Choose an existing project from dashup projects',
+      );
     const event: Attention = {
       type: 'attention',
       projectId,
-      threadId,
+      threadId: thread.id,
       title: title.slice(0, 200),
       body: body.slice(0, 1000),
       reason,
       ...(approvalId ? { approvalId } : {}),
     };
-    this.currentAttention.set(threadId, { event, updatedAt: thread.updatedAt });
+    this.currentAttention.set(thread.id, { event, updatedAt: thread.updatedAt });
     if (this.currentAttention.size > ATTENTION_ITEMS)
       this.currentAttention.delete(this.currentAttention.keys().next().value!);
     this.refreshOverview();
@@ -1594,7 +1639,7 @@ export class Connector {
   attach(socket: Duplex): void {
     const sessions = bridgeAcp(socket, (session, approval) => {
       this.agents.set(session.id, session);
-      const { project, thread } = this.adopt(session);
+      const { project, thread } = this.discovery.adopt(session);
       this.refreshOverview();
       this.scheduleSelected(false);
       if (approval)
@@ -1610,41 +1655,16 @@ export class Connector {
     socket.once('close', () => {
       for (const [id, agent] of sessions) {
         if (this.agents.get(id) !== agent) continue;
-        const { thread } = this.adopt(agent);
-        thread.status = 'unknown';
-        thread.capabilities = {
-          ...thread.capabilities,
-          send: false,
-          stop: false,
-          approve: false,
-          configure: false,
-        };
         this.agents.delete(id);
+        this.discovery.adopt(agent, false);
       }
       this.refreshOverview();
       this.scheduleSelected(false);
     });
   }
 
-  private adopt(agent: AcpSession): { project: ProjectSummary; thread: ThreadSummary } {
-    const found = this.discovery.live(agent.id, agent.cwd);
-    Object.assign(found.thread, {
-      status: agent.status,
-      updatedAt: agent.updatedAt,
-      capabilities: {
-        ...found.thread.capabilities,
-        send: true,
-        approve: true,
-        stop: true,
-        configure: agent.options.length > 0,
-      },
-      options: agent.options,
-    });
-    return found;
-  }
   private attached(thread: ThreadSummary): AcpSession | undefined {
-    const id = this.discovery.locations.get(thread.id)?.session;
-    return id ? this.agents.get(id) : undefined;
+    return this.discovery.locations.get(thread.id)?.acp;
   }
   private threadState(project: ProjectSummary, thread: ThreadSummary): ThreadState {
     const location = this.discovery.locations.get(thread.id);
@@ -1759,18 +1779,7 @@ export class Connector {
             origin.thread !== thread.id)
         )
           throw new Error('This attachment belongs to another conversation.');
-        const native = await this.discovery.locations
-          .get(thread.id)
-          ?.live?.readMessages?.(origin?.message);
-        if (
-          native &&
-          (!Array.isArray(native.messages) ||
-            native.messages.length > 64 ||
-            Buffer.byteLength(JSON.stringify(native.messages)) > 2 * 1024 * 1024)
-        )
-          throw new Error('The native conversation page exceeds its limit.');
-        const messages =
-          native?.messages ?? this.discovery.read(thread, this.attached(thread)?.messages);
+        const { messages } = await this.discovery.read(thread, origin?.message);
         return shareAttachment(
           this.config,
           pair,
@@ -1813,7 +1822,9 @@ export class Connector {
             this.nativeQueue.refresh();
             if (writerOwner(this.nativeQueue.writers, location.history))
               throw new Error(
-                'This Codex session is open on your computer. Queue a reply or continue it there.',
+                queueOwner(this.nativeQueue.owners, location.history)
+                  ? 'This Codex session is open on your computer. Queue a reply or continue it there.'
+                  : 'This Codex session is open on your computer. Continue it there.',
               );
           }
           await this.harnesses.resume(
@@ -1950,50 +1961,11 @@ export class Connector {
     throw new Error(`${HARNESSES[harness]} started, but this computer has not listed it yet.`);
   }
 
-  // A saved session nothing else has open continues headless when its agent runs here. One a
-  // native process owns takes queued messages instead.
-  private refreshResumes(): void {
-    for (const project of this.discovery.projects.values())
-      for (const thread of project.threads) {
-        const location = this.discovery.locations.get(thread.id);
-        const harness = thread.agent?.harness;
-        if (
-          location?.history &&
-          location.history.resumable !== false &&
-          !location.live &&
-          !project.remote &&
-          !thread.capabilities.queue &&
-          !writerOwner(this.nativeQueue.writers, location.history) &&
-          harness &&
-          isStartHarness(harness) &&
-          this.startable.includes(harness)
-        )
-          thread.capabilities = { ...thread.capabilities, send: true };
-      }
-  }
-
+  // Who owns each saved session's native queue and rollout is read again, and every thread nothing
+  // holds shows it.
   private refreshQueues(): void {
     this.nativeQueue.refresh();
-    for (const project of this.discovery.projects.values())
-      for (const thread of project.threads) {
-        const location = this.discovery.locations.get(thread.id);
-        const history = location?.history;
-        thread.capabilities = {
-          ...thread.capabilities,
-          queue: Boolean(queueOwner(this.nativeQueue.owners, history)),
-        };
-        // Persisted turn markers describe current work only while its native writer owns it.
-        if (history?.harness === 'codex' && !location?.live) {
-          thread.status = 'unknown';
-          try {
-            if (writerOwner(this.nativeQueue.writers, history))
-              thread.status = history.status?.() ?? 'unknown';
-          } catch {
-            // A rollout can disappear between discovery and reading its lifecycle marker.
-          }
-          thread.step = thread.status === 'working' ? history.step : undefined;
-        }
-      }
+    this.discovery.refresh();
   }
 
   // A thread no live session holds shows what its record says it last ran with, without the

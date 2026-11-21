@@ -269,12 +269,13 @@ test('Kilo observes existing native sessions and maps messages, queue/steer, abo
     assert.equal(session.title, 'Original Kilo work');
     assert.equal(session.cwd, '/original/project');
     assert.equal(session.status, 'attention');
-    assert.equal(session.messages[0]!.id, 'earlier');
-    assert.equal(session.messages[1]!.text, 'Original Kilo request');
-    assert.equal(session.messages[2]!.text, 'Original Kilo reply');
-    assert.equal(session.messages[3]!.text, 'Tests passed');
-    assert.equal(session.messages[3]!.tool!.name, 'bash');
-    assert.equal(session.messages[3]!.tool!.status, 'ok');
+    const conversation = (await session.readMessages!()).messages;
+    assert.equal(conversation[0]!.id, 'earlier');
+    assert.equal(conversation[1]!.text, 'Original Kilo request');
+    assert.equal(conversation[2]!.text, 'Original Kilo reply');
+    assert.equal(conversation[3]!.text, 'Tests passed');
+    assert.equal(conversation[3]!.tool!.name, 'bash');
+    assert.equal(conversation[3]!.tool!.status, 'ok');
     assert.equal(session.approvals.length, 2);
     assert.ok(
       session.approvals.find((item) => item.id === 'per_native')!.detail.includes('pnpm *'),
@@ -284,11 +285,8 @@ test('Kilo observes existing native sessions and maps messages, queue/steer, abo
       false,
     );
     assert.ok(native.calls.every((call) => call.method === 'GET'));
-    await Promise.all([
-      session.send!('send-once', 'Continue native work'),
-      session.send!('send-once', 'Continue native work'),
-    ]);
-    await session.send!('steer-once', 'Do this first', true);
+    await session.send!('send', 'Continue native work');
+    await session.send!('steer', 'Do this first', true);
     const prompts = native.calls.filter((call) => call.path.endsWith('/prompt'));
     assert.equal(prompts.length, 2);
     assert.match(prompts[0]!.body.id, /^msg_[a-f0-9]{32}$/);
@@ -296,8 +294,7 @@ test('Kilo observes existing native sessions and maps messages, queue/steer, abo
     assert.equal(prompts[0]!.body.delivery, 'queue');
     assert.equal(prompts[1]!.body.delivery, 'steer');
     assert.equal(prompts[0]!.path, '/api/session/ses_native/prompt');
-    await session.approve!('permission-once', 'per_native', { choice: 'always' });
-    await session.approve!('permission-once', 'per_native', { choice: 'always' });
+    await session.approve!('permission', 'per_native', { choice: 'always' });
     assert.deepEqual(
       native.calls.find((call) => call.path.includes('/permission/per_native/reply'))!.body,
       { reply: 'always' },
@@ -306,13 +303,12 @@ test('Kilo observes existing native sessions and maps messages, queue/steer, abo
       native.calls.filter((call) => call.path.includes('/permission/per_native/reply')).length,
       1,
     );
-    await session.approve!('question-once', 'question:que_native', { answers: [['Green']] });
+    await session.approve!('question', 'question:que_native', { answers: [['Green']] });
     assert.deepEqual(
       native.calls.find((call) => call.path.includes('/question/que_native/reply'))!.body,
       { answers: [['Green']] },
     );
-    await session.stop!('interrupt-once');
-    await session.stop!('interrupt-once');
+    await session.stop!('interrupt');
     assert.equal(native.calls.filter((call) => call.path.endsWith('/interrupt')).length, 1);
     assert.ok(
       native.calls.every(
@@ -335,7 +331,7 @@ test('Kilo observes existing native sessions and maps messages, queue/steer, abo
   }
 });
 
-test('Kilo re-reads original native sessions after event changes and avoids retrying uncertain actions', async () => {
+test('Kilo re-reads original native sessions after event changes and reports a failed send', async () => {
   const native = await fixture();
   let changes = 0;
   const kilo = new Kilo(() => {
@@ -386,15 +382,27 @@ test('Kilo re-reads original native sessions after event changes and avoids retr
     await waitFor(() => changes > before);
     session = (await kilo.refresh())[0]!;
     assert.equal(session.id, 'ses_native');
-    assert.equal(session.messages[2]!.text, 'Reply written in native Kilo');
+    assert.equal((await session.readMessages!()).messages[2]!.text, 'Reply written in native Kilo');
     for (const stream of native.streams) stream.destroy();
     await waitFor(() => native.streams.size === 0);
     await waitFor(() => native.streams.size > 0);
     assert.equal((await kilo.refresh())[0]!.id, 'ses_native');
     native.failPrompt();
-    await assert.rejects(session.send!('uncertain-send', 'Only dispatch once'));
-    await assert.rejects(session.send!('uncertain-send', 'Only dispatch once'));
+    await assert.rejects(session.send!('failed-send', 'Dispatched once'));
     assert.equal(native.calls.filter((call) => call.path.endsWith('/prompt')).length, 1);
+  } finally {
+    kilo.stop();
+    await native.close();
+  }
+});
+
+test('Kilo keeps taking commands however many it has taken', async () => {
+  const native = await fixture();
+  const kilo = new Kilo(() => {});
+  try {
+    const session = (await kilo.refresh())[0]!;
+    for (let sent = 0; sent <= 1_000; sent++) await session.send!(`send-${sent}`, 'Carry on');
+    assert.equal(native.calls.filter((call) => call.path.endsWith('/prompt')).length, 1_001);
   } finally {
     kilo.stop();
     await native.close();
@@ -671,7 +679,7 @@ test(
       const projected = await native(
         `/api/session/${encodeURIComponent(id)}/message?limit=200&order=desc`,
       );
-      assert.equal(original.messages.length, projected.data.length);
+      assert.equal((await original.readMessages!()).messages.length, projected.data.length);
       assert.equal((await native('/api/session/active')).data[id], undefined);
       assert.equal((await native('/api/session?limit=100')).data.length, before);
       for (const choice of ['once', 'reject']) {

@@ -19,12 +19,15 @@ import type { NativeAttachment } from '../src/harness/session';
 // =============================================================================
 
 const date = '2026-10-29T00:00:00.000Z';
-async function until<T>(read: () => Promise<T>, ready: (value: T) => boolean): Promise<T> {
+async function until<T>(
+  read: () => Promise<T>,
+  ready: (value: T) => boolean | Promise<boolean>,
+): Promise<T> {
   const end = Date.now() + 8_000;
   let value: T;
   do {
     value = await read();
-    if (ready(value)) return value;
+    if (await ready(value)) return value;
     await new Promise((resolve) => setTimeout(resolve, 25));
   } while (Date.now() < end);
   assert.fail('The native Pi event did not arrive');
@@ -176,15 +179,14 @@ test('Pi attaches, reconnects and sends real native replies, steering and abort 
     assert.equal(live?.cwd, '/original/project');
     assert.equal(live?.harness, 'pi');
     assert.deepEqual(
-      live?.messages.map((value) => value.text),
+      (await live!.readMessages!()).messages.map((value) => value.text),
       ['Existing Pi prompt', 'Existing Pi answer'],
     );
     assert.equal(live?.status, 'idle');
     assert.equal(live?.stop, undefined);
     assert.equal(live?.approve, undefined);
     const originalSend = live!.send!;
-    await originalSend('reply-once', 'Real phone reply');
-    await originalSend('reply-once', 'Real phone reply');
+    await originalSend('reply', 'Real phone reply');
     assert.equal(calls.length, 1);
     assert.equal(calls[0].options.deliverAs, 'followUp');
     [live] = await until(
@@ -193,7 +195,6 @@ test('Pi attaches, reconnects and sends real native replies, steering and abort 
     );
     await live!.send!('steer', 'Change direction', true);
     assert.equal(calls[1].options.deliverAs, 'steer');
-    await live!.stop!('abort');
     await live!.stop!('abort');
     assert.equal(aborts, 1);
     await emit('message_update', {
@@ -228,8 +229,13 @@ test('Pi attaches, reconnects and sends real native replies, steering and abort 
     pi.stop();
     pi = new Pi(() => {});
     [live] = await pi.refresh();
-    await live!.send!('reply-once', 'Real phone reply');
-    assert.equal(calls.length, 2, 'host deduplicates across connector reconnect');
+    await live!.send!('second-connector', 'Reply through the second connector');
+    assert.equal(calls.length, 3);
+    assert.equal(calls[2].text, 'Reply through the second connector');
+
+    // Neither the connector nor the extension stops taking commands after any number of them.
+    for (let sent = 0; sent <= 1_000; sent++) await live!.send!(`send-${sent}`, 'Carry on');
+    assert.equal(calls.length, 1_004);
 
     session = 'new-native-session';
     await emit('session_start');
@@ -452,13 +458,15 @@ test(
       await live!.send!('native-reply', 'Reply from phone to the existing Pi');
       [live] = await until(
         () => pi.refresh(),
-        (value) =>
+        async (value) =>
           value[0]?.status === 'idle' &&
-          value[0]?.messages.some((message) => message.text === 'Native response 1'),
+          (await value[0].readMessages!()).messages.some(
+            (message) => message.text === 'Native response 1',
+          ),
       );
       assert.equal(live!.id, id);
       assert.ok(
-        live!.messages.some(
+        (await live!.readMessages!()).messages.some(
           (message) =>
             message.role === 'user' && message.text === 'Reply from phone to the existing Pi',
         ),
@@ -475,12 +483,14 @@ test(
       release!();
       [live] = await until(
         () => pi.refresh(),
-        (value) =>
+        async (value) =>
           value[0]?.status === 'idle' &&
-          value[0]?.messages.some((message) => message.text === 'Native follow-up message'),
+          (await value[0].readMessages!()).messages.some(
+            (message) => message.text === 'Native follow-up message',
+          ),
       );
       assert.ok(
-        live!.messages.some(
+        (await live!.readMessages!()).messages.some(
           (message) => message.role === 'user' && message.text === 'Native steering message',
         ),
       );

@@ -201,14 +201,21 @@ async function main(): Promise<void> {
       body: option('--body') ?? '',
       reason: option('--reason') ?? 'input',
     });
-    const response = await running('/attention', { method: 'POST', body: JSON.stringify(input) });
-    if (!response.ok) throw new Error('Could not deliver the alert to this computer connector');
+    const response = await running('/attention', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }).catch(refused);
+    if (!response) throw new Error('Start dashup watch on this computer first');
+    if (!response.ok) {
+      const refusal = (await response.json().catch(() => null)) as { error?: string } | null;
+      throw new Error(refusal?.error || 'Could not deliver the alert to this computer connector');
+    }
     process.stdout.write('Encrypted alert queued.\n');
     return;
   }
   if (!['pair', 'watch'].includes(command)) {
     process.stdout.write(
-      'Dashup: pair [--account <email>] | watch | projects | alert --project <id> | phone-tools | doctor | stop | acp -- <original-agent-command> | install | uninstall\n',
+      'Dashup: pair [--account <email>] | watch | projects | alert --project <id> [--thread <id>] | phone-tools | doctor | stop | acp -- <original-agent-command> | install | uninstall\n',
     );
     return;
   }
@@ -339,8 +346,10 @@ async function main(): Promise<void> {
         input.reason,
       );
       response.end('{}');
-    } catch {
-      response.writeHead(400).end('{}');
+    } catch (error) {
+      response
+        .writeHead(400)
+        .end(JSON.stringify({ error: error instanceof Error ? error.message : 'Request failed.' }));
     }
   });
   server.on('connect', (request, socket) => {
@@ -380,11 +389,15 @@ async function main(): Promise<void> {
         if (!reported(error))
           process.stderr.write(`${error instanceof Error ? error.message : 'Pairing failed'}\n`);
       });
-      if (paired)
+      if (paired) {
+        // The scan can reach this walkthrough before the connector hears of it, and a connector that
+        // stops without the pairing's key leaves a pairing the next start revokes.
+        connector.accept(paired.pairing);
         await keepRunning(() => {
           connector?.stop();
           server.close();
         });
+      }
     }
   } catch (error) {
     connector?.stop();

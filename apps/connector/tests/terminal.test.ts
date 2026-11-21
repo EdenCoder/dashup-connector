@@ -34,7 +34,7 @@ test('paired PTY streams raw ANSI and retains only instance metadata', async () 
     terminals.input('phone', 'project', id, "printf '\\033[2J\\033[Hterminal-proof\\n'\r");
     await waitFor(() =>
       outputs.some((output) => output.data.includes('\x1b[2J\x1b[Hterminal-proof')));
-    assert.deepEqual(terminals.session(id)?.messages, []);
+    assert.equal(terminals.session(id)?.readMessages, undefined);
     terminals.resize('phone', 'project', id, 100, 30);
     terminals.unfollow('phone', 'project', id);
     await terminals.follow('phone', 'project', id);
@@ -80,7 +80,7 @@ test('terminal restart restores owned instance metadata without conversation mes
     const instance = restored.session(id)!;
     assert.equal(instance.status, 'idle');
     assert.equal(instance.send, undefined);
-    assert.deepEqual(instance.messages, []);
+    assert.equal(instance.readMessages, undefined);
     assert.equal(restored.owns(id, 'phone'), true);
     assert.equal(restored.owns(id, 'another-phone'), false);
     assert.ok(!(await readFile(join(directory, `${id}.json`), 'utf8')).includes('private-input'));

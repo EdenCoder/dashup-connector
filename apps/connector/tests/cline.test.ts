@@ -262,8 +262,9 @@ test('Cline observes original hub sessions, streams and maps native commands wit
     assert.equal(session.cwd, '/original/project');
     assert.equal(session.status, 'attention');
     assert.equal(session.title, 'Native work');
-    assert.equal(session.messages[1]!.text, 'Original Cline conversation');
-    assert.deepEqual(session.messages[2], {
+    let conversation = (await session.readMessages!()).messages;
+    assert.equal(conversation[1]!.text, 'Original Cline conversation');
+    assert.deepEqual(conversation[2], {
       id: 'cline:tool:tool-native',
       role: 'tool',
       text: 'Tests passed',
@@ -271,11 +272,11 @@ test('Cline observes original hub sessions, streams and maps native commands wit
         name: 'execute_command',
         summary: '{"command":"pnpm test"}',
         status: 'ok',
-        input: session.messages[2]!.tool!.input,
+        input: conversation[2]!.tool!.input,
       },
     });
     assert.deepEqual(
-      JSON.parse((session.messages[2]!.tool!.input as NativeAttachment).read().toString()),
+      JSON.parse((conversation[2]!.tool!.input as NativeAttachment).read().toString()),
       { command: 'pnpm test' },
     );
     assert.equal(
@@ -301,9 +302,10 @@ test('Cline observes original hub sessions, streams and maps native commands wit
     });
     await waitFor(() => changes > toolChange);
     session = (await cline.refresh())[0]!;
-    assert.equal(session.messages.at(-1)!.tool!.name, 'read_file');
-    assert.equal(session.messages.at(-1)!.tool!.summary, '{"path":"README.md"}');
-    const input = session.messages.at(-1)!.tool!.input as NativeAttachment;
+    conversation = (await session.readMessages!()).messages;
+    assert.equal(conversation.at(-1)!.tool!.name, 'read_file');
+    assert.equal(conversation.at(-1)!.tool!.summary, '{"path":"README.md"}');
+    const input = conversation.at(-1)!.tool!.input as NativeAttachment;
     assert.deepEqual(JSON.parse(input.read().toString()), { path: 'README.md' });
     const finishedChange = changes;
     native.event(socket, 'tool.finished', {
@@ -313,24 +315,21 @@ test('Cline observes original hub sessions, streams and maps native commands wit
     });
     await waitFor(() => changes > finishedChange);
     session = (await cline.refresh())[0]!;
-    assert.equal(session.messages.at(-1)!.text, 'Native file contents');
-    assert.equal(session.messages.at(-1)!.tool!.status, 'ok');
-    assert.equal(session.messages.at(-1)!.tool!.input?.id, input.id);
-    await Promise.all([
-      session.send!('send-once', 'Carry on'),
-      session.send!('send-once', 'Carry on'),
-    ]);
+    conversation = (await session.readMessages!()).messages;
+    assert.equal(conversation.at(-1)!.text, 'Native file contents');
+    assert.equal(conversation.at(-1)!.tool!.status, 'ok');
+    assert.equal(conversation.at(-1)!.tool!.input?.id, input.id);
+    await session.send!('send', 'Carry on');
     const sent = native.calls.filter((call) => call.command === 'session.send_input');
     assert.equal(sent.length, 1);
     assert.equal(sent[0].sessionId, 'original-session');
     assert.deepEqual(sent[0].payload, { prompt: 'Carry on', delivery: 'queue' });
-    await session.send!('steer-once', 'Do this first', true);
+    await session.send!('steer', 'Do this first', true);
     assert.equal(
       native.calls.filter((call) => call.command === 'session.send_input')[1].payload.delivery,
       'steer',
     );
-    await session.approve!('approve-once', 'native-approval', { choice: 'once' });
-    await session.approve!('approve-once', 'native-approval', { choice: 'once' });
+    await session.approve!('approve', 'native-approval', { choice: 'once' });
     assert.equal(native.calls.filter((call) => call.command === 'approval.respond').length, 1);
     assert.deepEqual(native.calls.find((call) => call.command === 'approval.respond').payload, {
       approvalId: 'native-approval',
@@ -340,8 +339,7 @@ test('Cline observes original hub sessions, streams and maps native commands wit
       session.approve!('approve-again', 'native-approval', { choice: 'once' }),
       /no longer pending/,
     );
-    await session.stop!('stop-once');
-    await session.stop!('stop-once');
+    await session.stop!('stop');
     assert.equal(native.calls.filter((call) => call.command === 'run.abort').length, 1);
     assert.ok(
       native.calls.every((call) => !/create|resume|detach|delete|configure/.test(call.command)),
@@ -369,14 +367,16 @@ test('Cline reconnects the same session with a replay cursor and never retries a
     native.setContent('Native reply while Dashup was offline');
     session = (await cline.refresh())[0]!;
     assert.equal(session.id, 'original-session');
-    assert.equal(session.messages[1]!.text, 'Native reply while Dashup was offline');
+    assert.equal(
+      (await session.readMessages!()).messages[1]!.text,
+      'Native reply while Dashup was offline',
+    );
     assert.equal(native.requests.length, 2);
     const subscriptions = native.frames.filter((frame) => frame.kind === 'stream.subscribe');
     assert.equal(subscriptions[1].sinceSequence, 1);
     const registrations = native.calls.filter((call) => call.command === 'client.register');
     assert.equal(registrations[0].clientId, registrations[1].clientId);
     assert.equal(session.approvals[0]!.id, 'native-approval');
-    await assert.rejects(session.send!('uncertain', 'One dispatch'), /disconnected/);
     assert.equal(native.calls.filter((call) => call.command === 'session.send_input').length, 1);
     await session.approve!('reject-native', 'native-approval', { choice: 'reject' });
     assert.equal(

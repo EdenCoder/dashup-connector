@@ -1,6 +1,6 @@
 {
   "name": "@dashup/connector",
-  "version": "0.1.39",
+  "version": "0.1.41",
   "license": "MIT",
   "homepage": "https://dashup.com",
   "repository": {
@@ -27,7 +27,7 @@
     "start": "node dist/index.js watch",
     "build": "tsup",
     "check-types": "tsc --noEmit",
-    "test": "node --import tsx --test tests/connector.test.ts tests/chat.test.ts tests/harness-history.test.ts tests/harness-live.test.ts tests/opencode-service.test.ts tests/harness-processes.test.ts tests/harness-queue.test.ts tests/harness-vscode.test.ts tests/cline.test.ts tests/pi.test.ts tests/kilo.test.ts tests/junie.test.ts tests/install.test.ts tests/headless.test.ts tests/stop.test.ts tests/attention.test.ts tests/uploads.test.ts tests/terminal.test.ts tests/pipe.test.ts tests/phone.test.ts tests/workbenches.test.ts tests/resets.test.ts"
+    "test": "node --import tsx --test \"tests/*.test.ts\""
   },
   "engines": {
     "node": ">=24.0.0"

@@ -75,7 +75,6 @@ export class Terminals {
       title: session.title,
       updatedAt: session.updatedAt,
       status: session.running ? 'working' : 'idle',
-      messages: [],
       approvals: [],
       ...(session.running
         ? {

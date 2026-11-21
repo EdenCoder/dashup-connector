@@ -84,10 +84,17 @@ export function encryptContent(
   content: unknown,
   random: RandomBytes,
 ): { nonce: string; ciphertext: string } {
+  return encryptBytes(key, associatedData, utf8ToBytes(JSON.stringify(content)), random);
+}
+
+export function encryptBytes(
+  key: string,
+  associatedData: Uint8Array,
+  bytes: Uint8Array,
+  random: RandomBytes,
+): { nonce: string; ciphertext: string } {
   const nonce = random(NONCE_BYTES);
-  const ciphertext = xchacha20poly1305(hexToBytes(key), nonce, associatedData).encrypt(
-    utf8ToBytes(JSON.stringify(content)),
-  );
+  const ciphertext = xchacha20poly1305(hexToBytes(key), nonce, associatedData).encrypt(bytes);
   return { nonce: bytesToHex(nonce), ciphertext: bytesToHex(ciphertext) };
 }
 

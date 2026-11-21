@@ -210,7 +210,7 @@ test(
       assert.equal(session?.harness, 'orca');
       assert.equal(session?.cwd, '/fixture/project');
       assert.equal(session?.status, 'working');
-      assert.deepEqual(session?.messages, []);
+      assert.ok(!('messages' in session!));
       assert.deepEqual(fixture.calls.map((call) => call.method).sort(), [
         'session.tabs.listAll',
         'worktree.ps',
@@ -228,10 +228,7 @@ test(
           Number(JSON.parse(latest.messages[0]!.id)[1]),
       );
       assert.equal(session!.approvals[0]?.title, 'Run unit tests');
-      await Promise.all([
-        session!.send!('send-native', 'Continue on my phone'),
-        session!.send!('send-native', 'Continue on my phone'),
-      ]);
+      await session!.send!('send-native', 'Continue on my phone');
       const send = fixture.calls.filter((call) => call.method === 'agentSession.send');
       assert.equal(send.length, 1);
       assert.equal(send[0].params.body.role, 'user');
@@ -239,7 +236,6 @@ test(
         send[0].params.envelope.payloadFingerprint,
         orcaFingerprint('agentSession.send', session!.id, { body: send[0].params.body }),
       );
-      await assert.rejects(session!.send!('send-native', 'Different message'), /already used/);
       await session!.stop!('stop-native');
       await session!.approve!('approval-native', session!.approvals[0]!.id, {
         choice: 'allow_once',
@@ -370,6 +366,7 @@ async function t3Fixture(count = 3, longText = false) {
   const calls: { path: string; authorization?: string }[] = [];
   const commands: any[] = [];
   const token = 'fixture-t3-bearer';
+  let refusing = false;
   const item = (id: number) => ({
     position: id,
     visibility: 'local',
@@ -393,7 +390,10 @@ async function t3Fixture(count = 3, longText = false) {
     assert.equal(request.headers.authorization, `Bearer ${token}`);
     assert.equal(request.headers['x-t3-orchestration-protocol'], '2');
     response.setHeader('content-type', 'application/json');
-    if (request.url?.startsWith('/api/orchestration/shell?'))
+    if (refusing) {
+      response.statusCode = 503;
+      response.end('{}');
+    } else if (request.url?.startsWith('/api/orchestration/shell?'))
       response.end(
         JSON.stringify({
           projects: [{ id: 'native-project', workspaceRoot: '/fixture/t3-project' }],
@@ -499,6 +499,9 @@ async function t3Fixture(count = 3, longText = false) {
     calls,
     commands,
     record,
+    refuse: (value: boolean) => {
+      refusing = value;
+    },
     close: async () => {
       restore();
       for (const client of ws.clients) client.terminate();
@@ -518,7 +521,7 @@ test('T3 Code attaches through authenticated native metadata and pages bounded h
     assert.equal(session?.harness, 't3');
     assert.equal(session?.cwd, '/fixture/t3-project');
     assert.equal(session?.status, 'working');
-    assert.deepEqual(session?.messages, []);
+    assert.ok(!('messages' in session!));
     assert.equal(fixture.calls.length, 1);
     assert.match(fixture.calls[0]!.path, /^\/api\/orchestration\/shell\?/);
     const latest = await session!.readMessages!();
@@ -528,10 +531,7 @@ test('T3 Code attaches through authenticated native metadata and pages bounded h
     assert.equal(older.messages.length, 4);
     assert.equal(older.messages.at(-1)!.id, latest.messages[0]!.id);
     assert.match(older.messages[0]!.id, /native-t3-item-8/);
-    await Promise.all([
-      session!.send!('native-send', 'Continue'),
-      session!.send!('native-send', 'Continue'),
-    ]);
+    await session!.send!('native-send', 'Continue');
     assert.equal(fixture.commands.length, 1);
     assert.equal(fixture.commands[0].createdBy, 'user');
     assert.equal(fixture.commands[0].creationSource, 'mobile');
@@ -589,9 +589,39 @@ test(
       assert.ok(!args.includes(fixture.token));
       assert.equal(fixture.commands.length, 0);
       assert.equal(fixture.calls.length, 1);
-      assert.deepEqual(session!.messages, []);
+      assert.ok(!('messages' in session!));
       assert.equal(await adapter.refresh().then((sessions) => sessions[0]), session);
       assert.equal(fixture.commands.length, 0);
+    } finally {
+      adapter.stop();
+      restore();
+      await fixture.close();
+    }
+  },
+);
+
+test(
+  'T3 Code keeps one scoped auth session while T3 refuses to be read',
+  { skip: process.platform === 'win32' },
+  async () => {
+    const fixture = await t3Fixture();
+    const cli = join(fixture.root, 't3-cli.mjs');
+    const issued = join(fixture.root, 'issued');
+    await writeFile(
+      cli,
+      `#!/usr/bin/env node\nimport { appendFileSync } from 'node:fs';\nappendFileSync(${JSON.stringify(issued)}, 'session\\n');\nprocess.stdout.write(JSON.stringify({ token: ${JSON.stringify(fixture.token)}, expiresAt: new Date(Date.now()+600000).toISOString() }));\n`,
+      { mode: 0o700 },
+    );
+    const restore = environment({ DASHUP_T3_AUTH_FILE: undefined, DASHUP_T3_CLI: cli });
+    const adapter = new T3(() => {});
+    try {
+      assert.equal((await adapter.refresh()).length, 1);
+      fixture.refuse(true);
+      assert.deepEqual(await adapter.refresh(), []);
+      assert.deepEqual(await adapter.refresh(), []);
+      fixture.refuse(false);
+      assert.equal((await adapter.refresh()).length, 1);
+      assert.equal(await readFile(issued, 'utf8'), 'session\n');
     } finally {
       adapter.stop();
       restore();

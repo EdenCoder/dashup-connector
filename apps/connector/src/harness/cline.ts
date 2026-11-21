@@ -1,14 +1,14 @@
 import { homedir } from 'node:os';
+import { readdir } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { constants } from 'node:fs';
 import { join, isAbsolute } from 'node:path';
-import { open, stat, readdir } from 'node:fs/promises';
 
 import WebSocket from 'ws';
 import type { Message, Approval, ApprovalReply } from '@dashup/protocol';
 
-import { privateRecord } from './local-file';
-import { EARLIER, toolInput, NO_PREVIEW, MAX_PREVIEW, type LiveSession } from './session';
+import { loopback } from './local-http';
+import { readRecord, ownProcess } from './local-file';
+import { EARLIER, toolInput, NO_PREVIEW, MAX_PREVIEW, singleFlight, liveDiscovery, type LiveSession } from './session';
 
 // =============================================================================
 // Existing local Cline hubs
@@ -19,8 +19,6 @@ const REQUEST_MS    = 4_000;
 const MAX_HUBS      = 32;
 const MAX_SESSIONS  = 100;
 const MAX_MESSAGES  = 1_000;
-const MAX_REQUESTS  = 1_000;
-const MAX_RECORD    = 64 * 1024;
 const MAX_BYTES     = 8 * 1024 * 1024;
 const APPROVALS     = [
   { id: 'once', label: 'Allow once' },
@@ -37,67 +35,39 @@ type Pending = {
 };
 
 // The auth token comes only from a same-user native discovery file, never a remote URL.
-export function clineEndpoint(value: string): string {
-  const url = new URL(value);
-  if (
-    url.protocol !== 'ws:' ||
-    !['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname) ||
-    url.username ||
-    url.password ||
-    url.search ||
-    url.hash
-  )
-    throw new Error('Cline endpoint must be an uncredentialed loopback WebSocket origin');
-  if (url.hostname === 'localhost') url.hostname = '127.0.0.1';
-  return url.toString();
-}
+export const clineEndpoint = (value: string): string =>
+  loopback(
+    value,
+    'ws:',
+    'Cline endpoint must be an uncredentialed loopback WebSocket origin',
+  ).toString();
 
 async function owner(path: string): Promise<Owner | undefined> {
-  if (!(await privateRecord(path, MAX_RECORD))) return;
-  const file = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-  try {
-    const info = await file.stat();
-    if (
-      !info.isFile() ||
-      info.size > MAX_RECORD ||
-      (process.getuid && (info.uid !== process.getuid() || (info.mode & 0o077) !== 0))
-    )
-      return;
-    const value = JSON.parse(await file.readFile('utf8'));
-    if (
-      !value ||
-      typeof value.hubId !== 'string' ||
-      !value.hubId ||
-      value.protocolVersion !== VERSION ||
-      (value.minClientProtocolVersion && value.minClientProtocolVersion !== VERSION) ||
-      (value.maxClientProtocolVersion && value.maxClientProtocolVersion !== VERSION) ||
-      typeof value.authToken !== 'string' ||
-      !/^[A-Za-z0-9._~-]{1,512}$/.test(value.authToken) ||
-      typeof value.startedAt !== 'string' ||
-      !Number.isFinite(Date.parse(value.startedAt)) ||
-      !Number.isSafeInteger(value.pid) ||
-      value.pid <= 0 ||
-      typeof value.url !== 'string'
-    )
-      return;
-    const url = clineEndpoint(value.url);
-    if (Number(new URL(url).port || 80) !== value.port) return;
-    process.kill(value.pid, 0);
-    if (
-      process.platform === 'linux' &&
-      process.getuid &&
-      (await stat(`/proc/${value.pid}`)).uid !== process.getuid()
-    )
-      return;
-    return { hubId: value.hubId, url, authToken: value.authToken, startedAt: value.startedAt };
-  } finally {
-    await file.close();
-  }
+  const value = await readRecord(path);
+  if (
+    !value ||
+    typeof value.hubId !== 'string' ||
+    !value.hubId ||
+    value.protocolVersion !== VERSION ||
+    (value.minClientProtocolVersion && value.minClientProtocolVersion !== VERSION) ||
+    (value.maxClientProtocolVersion && value.maxClientProtocolVersion !== VERSION) ||
+    typeof value.authToken !== 'string' ||
+    !/^[A-Za-z0-9._~-]{1,512}$/.test(value.authToken) ||
+    typeof value.startedAt !== 'string' ||
+    !Number.isFinite(Date.parse(value.startedAt)) ||
+    !Number.isSafeInteger(value.pid) ||
+    value.pid <= 0 ||
+    typeof value.url !== 'string'
+  )
+    return;
+  const url = clineEndpoint(value.url);
+  if (Number(new URL(url).port || 80) !== value.port || !(await ownProcess(value.pid))) return;
+  return { hubId: value.hubId, url, authToken: value.authToken, startedAt: value.startedAt };
 }
 
 async function owners(): Promise<Owner[]> {
   const explicit = process.env.CLINE_HUB_DISCOVERY_PATH?.trim();
-  if (process.env.DASHUP_LIVE_DISCOVERY === '0' && !explicit) return [];
+  if (!liveDiscovery() && !explicit) return [];
   const data =
     process.env.CLINE_DATA_DIR?.trim() ||
     join(process.env.CLINE_DIR?.trim() || join(homedir(), '.cline'), 'data');
@@ -421,25 +391,46 @@ class Hub {
     });
   }
 
-  async refresh(
-    once: (id: string, action: () => Promise<void>) => Promise<void>,
-  ): Promise<LiveSession[]> {
+  async refresh(): Promise<LiveSession<'cline'>[]> {
     await this.connect();
     const listed = await this.command('session.list', { limit: MAX_SESSIONS });
     if (!Array.isArray(listed.sessions)) return [];
-    const sessions: LiveSession[] = [];
-    // Bound concurrent message reads; discovery never creates, resumes or starts a session.
-    for (let index = 0; index < Math.min(listed.sessions.length, MAX_SESSIONS); index += 8) {
-      const batch = await Promise.allSettled(
-        listed.sessions.slice(index, index + 8).map(async (record: Data) => {
-          if (
-            typeof record?.sessionId !== 'string' ||
-            !record.sessionId ||
-            typeof (record.cwd ?? record.workspaceRoot) !== 'string' ||
-            !isAbsolute(record.cwd ?? record.workspaceRoot)
-          )
-            return;
-          const id = record.sessionId;
+    const sessions: LiveSession<'cline'>[] = [];
+    const drafts = this.typing;
+    // Discovery never creates, resumes or starts a session.
+    for (const record of listed.sessions.slice(0, MAX_SESSIONS) as Data[]) {
+      if (
+        typeof record?.sessionId !== 'string' ||
+        !record.sessionId ||
+        typeof (record.cwd ?? record.workspaceRoot) !== 'string' ||
+        !isAbsolute(record.cwd ?? record.workspaceRoot)
+      )
+        continue;
+      const id = record.sessionId;
+      const approvals = [...this.approvals.values()]
+        .filter((item) => item.sessionId === id)
+        .map((item) => item.value);
+      const current = (): void => {
+        if (!this.connected || this.stopped)
+          throw new Error('Cline hub is disconnected; reconnect before sending');
+      };
+      const updated =
+        typeof record.updatedAt === 'number' ? record.updatedAt : Date.parse(record.updatedAt);
+      const title = record.metadata?.title ?? record.metadata?.prompt;
+      sessions.push({
+        id,
+        cwd: record.cwd ?? record.workspaceRoot,
+        harness: 'cline',
+        ...(typeof title === 'string' && title.trim() ? { title: title.trim().slice(0, 200) } : {}),
+        updatedAt: new Date(Number.isFinite(updated) ? updated : 0).toISOString(),
+        status: approvals.length
+          ? 'attention'
+          : ['running', 'pending'].includes(record.status)
+            ? 'working'
+            : 'idle',
+        // Tool steps streamed since the conversation was saved stand in for theirs, and the
+        // reply being written goes once the conversation holds it, so it is read after.
+        readMessages: async () => {
           const read = await this.command('session.messages', { sessionId: id }, id);
           const history = messages(read.messages);
           for (const [key, item] of this.tools) {
@@ -449,85 +440,57 @@ class Hub {
             else if (saved >= 0) history[saved] = item.message;
             else history.push(item.message);
           }
-          const typing = this.typing.get(id);
+          const typing = drafts.get(id);
           if (
             typing &&
             history.some((message) => message.role === 'assistant' && message.text.endsWith(typing))
           )
-            this.typing.delete(id);
-          const approvals = [...this.approvals.values()]
-            .filter((item) => item.sessionId === id)
-            .map((item) => item.value);
-          const current = (): void => {
-            if (!this.connected || this.stopped)
-              throw new Error('Cline hub is disconnected; reconnect before sending');
-          };
-          const updated =
-            typeof record.updatedAt === 'number' ? record.updatedAt : Date.parse(record.updatedAt);
-          const title = record.metadata?.title ?? record.metadata?.prompt;
-          const session: LiveSession = {
+            drafts.delete(id);
+          return { messages: history, more: false };
+        },
+        approvals,
+        get typing() {
+          return drafts.get(id);
+        },
+        now: true,
+        send: async (_requestId, prompt, now) => {
+          current();
+          if (!prompt.trim()) throw new Error('Write a message for Cline first');
+          await this.command(
+            'session.send_input',
+            { prompt, delivery: now ? 'steer' : 'queue' },
             id,
-            cwd: record.cwd ?? record.workspaceRoot,
-            harness: 'cline',
-            ...(typeof title === 'string' && title.trim()
-              ? { title: title.trim().slice(0, 200) }
-              : {}),
-            updatedAt: new Date(Number.isFinite(updated) ? updated : 0).toISOString(),
-            status: approvals.length
-              ? 'attention'
-              : ['running', 'pending'].includes(record.status)
-                ? 'working'
-                : 'idle',
-            messages: history,
-            approvals,
-            ...(this.typing.has(id) ? { typing: this.typing.get(id) } : {}),
-            now: true,
-            send: (requestId, prompt, now) =>
-              once(requestId, async () => {
+            true,
+          );
+        },
+        stop: async () => {
+          current();
+          await this.command('run.abort', { sessionId: id }, id);
+        },
+        ...(approvals.length
+          ? {
+              approve: async (_requestId: string, approvalId: string, reply: ApprovalReply) => {
                 current();
-                if (!prompt.trim()) throw new Error('Write a message for Cline first');
+                const item = this.approvals.get(approvalId);
+                if (!item || item.sessionId !== id)
+                  throw new Error('Cline approval is no longer pending');
+                if (
+                  !('choice' in reply) ||
+                  !item.value.choices.some((choice) => choice.id === reply.choice)
+                )
+                  throw new Error('This Cline request must be reviewed on your computer');
+                // Consume before dispatch: an uncertain delivery must never trigger a second answer.
+                this.approvals.delete(approvalId);
                 await this.command(
-                  'session.send_input',
-                  { prompt, delivery: now ? 'steer' : 'queue' },
+                  'approval.respond',
+                  { approvalId, approved: reply.choice === 'once' },
                   id,
-                  true,
                 );
-              }),
-            stop: (requestId) =>
-              once(requestId, async () => {
-                current();
-                await this.command('run.abort', { sessionId: id }, id);
-              }),
-            ...(approvals.length
-              ? {
-                  approve: (requestId: string, approvalId: string, reply: ApprovalReply) =>
-                    once(requestId, async () => {
-                      current();
-                      const item = this.approvals.get(approvalId);
-                      if (!item || item.sessionId !== id)
-                        throw new Error('Cline approval is no longer pending');
-                      if (
-                        !('choice' in reply) ||
-                        !item.value.choices.some((choice) => choice.id === reply.choice)
-                      )
-                        throw new Error('This Cline request must be reviewed on your computer');
-                      // Consume before dispatch: an uncertain delivery must never trigger a second answer.
-                      this.approvals.delete(approvalId);
-                      await this.command(
-                        'approval.respond',
-                        { approvalId, approved: reply.choice === 'once' },
-                        id,
-                      );
-                      this.changed();
-                    }),
-                }
-              : {}),
-          };
-          return session;
-        }),
-      );
-      for (const result of batch)
-        if (result.status === 'fulfilled' && result.value) sessions.push(result.value);
+                this.changed();
+              },
+            }
+          : {}),
+      });
     }
     return this.connected ? sessions : [];
   }
@@ -549,53 +512,36 @@ class Hub {
 export class Cline {
   constructor(private readonly changed: () => void) {}
 
+  readonly harness = 'cline';
   private readonly hubs = new Map<string, Hub>();
-  private readonly requests = new Map<string, Promise<void>>();
-  private refreshing?: Promise<LiveSession[]>;
+  private readonly discovering = singleFlight(() => this.discover());
   private stopped = false;
 
-  private once = (id: string, action: () => Promise<void>): Promise<void> => {
-    const known = this.requests.get(id);
-    if (known) return known;
-    if (this.requests.size >= MAX_REQUESTS)
-      throw new Error('Cline command history is full; restart the connector before sending');
-    const pending = Promise.resolve().then(action);
-    this.requests.set(id, pending);
-    return pending;
-  };
+  refresh(): Promise<LiveSession<'cline'>[]> {
+    return this.stopped ? Promise.resolve([]) : this.discovering();
+  }
 
-  refresh(): Promise<LiveSession[]> {
-    if (this.stopped) return Promise.resolve([]);
-    if (this.refreshing) return this.refreshing;
-    const task = (async () => {
-      const discovered = await owners();
-      if (this.stopped) return [];
-      const keys = new Set<string>();
-      for (const record of discovered) {
-        const key = `${record.hubId}\0${record.url}\0${record.startedAt}\0${record.authToken}`;
-        keys.add(key);
-        if (!this.hubs.has(key)) this.hubs.set(key, new Hub(record, this.changed));
+  private async discover(): Promise<LiveSession<'cline'>[]> {
+    const discovered = await owners();
+    if (this.stopped) return [];
+    const keys = new Set<string>();
+    for (const record of discovered) {
+      const key = `${record.hubId}\0${record.url}\0${record.startedAt}\0${record.authToken}`;
+      keys.add(key);
+      if (!this.hubs.has(key)) this.hubs.set(key, new Hub(record, this.changed));
+    }
+    for (const [key, hub] of this.hubs)
+      if (!keys.has(key)) {
+        hub.stop();
+        this.hubs.delete(key);
       }
-      for (const [key, hub] of this.hubs)
-        if (!keys.has(key)) {
-          hub.stop();
-          this.hubs.delete(key);
-        }
-      const results = await Promise.allSettled(
-        [...this.hubs.values()].map((hub) => hub.refresh(this.once)),
-      );
-      const sessions = new Map<string, LiveSession>();
-      for (const result of results)
-        if (result.status === 'fulfilled')
-          for (const session of result.value)
-            if (!sessions.has(session.id)) sessions.set(session.id, session);
-      return this.stopped ? [] : [...sessions.values()];
-    })();
-    this.refreshing = task;
-    void task.finally(() => {
-      if (this.refreshing === task) this.refreshing = undefined;
-    });
-    return task;
+    const results = await Promise.allSettled([...this.hubs.values()].map((hub) => hub.refresh()));
+    const sessions = new Map<string, LiveSession<'cline'>>();
+    for (const result of results)
+      if (result.status === 'fulfilled')
+        for (const session of result.value)
+          if (!sessions.has(session.id)) sessions.set(session.id, session);
+    return this.stopped ? [] : [...sessions.values()];
   }
 
   stop(): void {

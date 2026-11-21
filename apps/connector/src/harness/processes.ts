@@ -1,4 +1,22 @@
-import { execFileSync } from 'node:child_process';
+import { promisify } from 'node:util';
+import { execFile, execFileSync } from 'node:child_process';
+
+// =============================================================================
+// Installed agent commands
+// =============================================================================
+
+// What a command prints as its version, where it runs on this computer.
+export const commandVersion = (command: string): Promise<string | undefined> =>
+  promisify(execFile)(command, ['--version'], {
+    timeout: 10_000,
+    shell: process.platform === 'win32',
+  }).then(
+    ({ stdout }) => stdout,
+    () => undefined,
+  );
+
+export const commandRuns = async (command: string): Promise<boolean> =>
+  (await commandVersion(command)) !== undefined;
 
 // =============================================================================
 // Linux native process candidates

@@ -1,9 +1,9 @@
 import { join } from 'node:path';
-import { createHash, randomUUID, randomBytes, timingSafeEqual } from 'node:crypto';
+import { randomUUID, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer, type Socket, type Server } from 'node:net';
 import { mkdir, writeFile, rename, unlink } from 'node:fs/promises';
 
-import { PI_HOST, PI_VERSION, PI_MAX_TEXT, PI_MAX_FRAME, PI_REQUEST_MS, PI_MAX_ENTRIES, PI_MAX_HISTORY, PI_MAX_CLIENTS, PI_MAX_COMMAND, PI_MAX_REQUESTS, piFrame, piPrivate, piDirectory, type PiEntry, type PiCommand, type PiSnapshot } from './bridge';
+import { PI_HOST, PI_VERSION, PI_MAX_TEXT, PI_MAX_FRAME, PI_REQUEST_MS, PI_MAX_ENTRIES, PI_MAX_HISTORY, PI_MAX_CLIENTS, PI_MAX_COMMAND, piFrame, piPrivate, piDirectory, type PiEntry, type PiCommand, type PiSnapshot } from './bridge';
 
 // =============================================================================
 // Pi's supported extension surface (host-provided, no runtime dependencies)
@@ -117,7 +117,6 @@ export default function dashup(pi: PiAPI): void {
   let notify: ReturnType<typeof setTimeout> | undefined;
   const clients = new Set<Socket>();
   const authenticated = new Set<Socket>();
-  const requests = new Map<string, { fingerprint: string; response: Data }>();
 
   function snapshot(): PiSnapshot {
     if (!context) throw new Error('Pi session is unavailable');
@@ -168,7 +167,6 @@ export default function dashup(pi: PiAPI): void {
     clearTimeout(notify);
     notify = undefined;
     context = undefined;
-    requests.clear();
     for (const client of clients) client.destroy();
     clients.clear();
     authenticated.clear();
@@ -192,21 +190,8 @@ export default function dashup(pi: PiAPI): void {
       socket.destroy();
       return;
     }
-    const fingerprint = createHash('sha256').update(JSON.stringify(request)).digest('hex');
-    const prior = requests.get(request.id);
-    if (prior) {
-      write(
-        socket,
-        prior.fingerprint === fingerprint
-          ? prior.response
-          : { type: 'result', id: request.id, error: 'Pi request id was already used' },
-      );
-      return;
-    }
     let error: string | undefined;
     try {
-      if (requests.size >= PI_MAX_REQUESTS)
-        throw new Error('Pi command limit reached; reload the extension');
       if (request.session !== context.sessionManager.getSessionId())
         throw new Error('Pi session changed');
       if (request.method === 'send') {
@@ -227,9 +212,7 @@ export default function dashup(pi: PiAPI): void {
     } catch (cause) {
       error = cause instanceof Error ? cause.message : 'Pi rejected the command';
     }
-    const response = { type: 'result', id: request.id, ...(error ? { error } : {}) };
-    if (requests.size < PI_MAX_REQUESTS) requests.set(request.id, { fingerprint, response });
-    write(socket, response);
+    write(socket, { type: 'result', id: request.id, ...(error ? { error } : {}) });
     changed(context);
   }
 

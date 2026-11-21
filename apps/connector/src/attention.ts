@@ -1,3 +1,4 @@
+import type { ThreadSummary } from '@dashup/protocol';
 import { notificationDecision, notificationResumeAt, type AttentionReason, type NotificationPolicy } from '@dashup/protocol/attention';
 import { encryptContent, decryptContent } from '@dashup/protocol/crypto';
 import { randomBytes } from 'node:crypto';
@@ -34,9 +35,21 @@ export type PendingAttention = {
   known?  : boolean;
   offline? : boolean;
   delivered? : boolean;
+  // Deliveries of this item that failed since one last succeeded.
+  failed? : number;
 };
 
 export type StoredAttention = { pairing: string; nonce: string; ciphertext: string };
+
+// The conversation an alert about a project is for when it names none: the project's latest that
+// is not working, because a working agent takes no alert, and not a terminal, which one phone owns.
+export const alertThread = (threads: ThreadSummary[]): ThreadSummary | undefined =>
+  threads
+    .filter((thread) => thread.status !== 'working' && thread.agent?.harness !== 'terminal')
+    .reduce<ThreadSummary | undefined>(
+      (latest, thread) => (latest && latest.updatedAt >= thread.updatedAt ? latest : thread),
+      undefined,
+    );
 
 const pendingData = (pairing: string) => Buffer.from(JSON.stringify(['dashup:attention', pairing]));
 
@@ -69,8 +82,9 @@ type Delivery = {
 
 const DECISION_SETTLE_MS   = 1_500;
 const COMPLETION_SETTLE_MS = 5_000;
+const RETRY_MS             = 2_000;
 const MAX_TIMER_MS         = 60_000;
-const MAX_PENDING         = 1_000;
+const MAX_PENDING          = 1_000;
 
 export class AttentionDelivery {
   private readonly pending = new Map<string, PendingAttention>();
@@ -149,6 +163,7 @@ export class AttentionDelivery {
       silent : previous?.silent ?? false,
       digest : previous?.digest ?? false,
       known  : !!state && state.status !== 'unknown',
+      ...(previous?.failed ? { failed: previous.failed } : {}),
     });
     // A disconnected phone cannot grow an unbounded queue of obsolete asks.
     while (this.pending.size > MAX_PENDING) this.pending.delete(this.pending.keys().next().value!);
@@ -192,6 +207,25 @@ export class AttentionDelivery {
     });
     this.running = run;
     return run;
+  }
+
+  // A failed delivery fails the flush. Its items wait twice as long after each failure, up to
+  // MAX_TIMER_MS.
+  private async deliver(
+    items: PendingAttention[],
+    event: AttentionEvent,
+    notify: boolean,
+  ): Promise<void> {
+    try {
+      await this.delivery.deliver(items[0]!.pairing, event, notify);
+    } catch (error) {
+      for (const item of items) {
+        item.failed = (item.failed ?? 0) + 1;
+        item.due = this.now() + Math.min(MAX_TIMER_MS, RETRY_MS * 2 ** (item.failed - 1));
+      }
+      throw error;
+    }
+    for (const item of items) delete item.failed;
   }
 
   private async flushNow(): Promise<void> {
@@ -251,7 +285,7 @@ export class AttentionDelivery {
       const project = item.event.type === 'attention' ? item.event.projectId : '';
       const decision = notificationDecision(policy, project, item.event.reason, now);
       if (decision === 'notify') {
-        await this.delivery.deliver(item.pairing, item.event, true);
+        await this.deliver([item], item.event, true);
         if (
           this.delivery.clear &&
           item.event.type === 'attention' &&
@@ -264,7 +298,7 @@ export class AttentionDelivery {
         continue;
       }
       if (!item.silent) {
-        await this.delivery.deliver(item.pairing, item.event, false);
+        await this.deliver([item], item.event, false);
         item.silent = true;
       }
       if (decision === 'silent') {
@@ -288,8 +322,8 @@ export class AttentionDelivery {
     }
     for (const [pairing, items] of digests) {
       const latest = items.at(-1)!;
-      await this.delivery.deliver(
-        pairing,
+      await this.deliver(
+        items,
         {
           ...latest.event,
           title:

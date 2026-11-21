@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, lstat, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, request, type IncomingMessage, type ServerResponse } from 'node:http';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { test } from 'node:test';
@@ -11,7 +11,8 @@ import { Codex } from '../src/harness/codex';
 import { Claude } from '../src/harness/claude';
 import { agentHarness, type LiveSession } from '../src/harness/session';
 import { LiveHarnesses } from '../src/harness/live';
-import { localEndpoint } from '../src/harness/opencode';
+import { OpenCode, localEndpoint } from '../src/harness/opencode';
+import { piDirectory } from '../pi/bridge';
 
 // =============================================================================
 // Existing native endpoint fixtures
@@ -29,9 +30,11 @@ test('live-only integrations keep native identities without gaining permission t
   assert.equal(agentHarness('junie'), 'junie');
 });
 
+type Adapters = Record<string, { refresh?: () => Promise<LiveSession[]> }>;
+
 test('OpenCode activity and controls come from the executing server when several servers list the same history', async () => {
   const live = new LiveHarnesses();
-  const adapters = live as unknown as Record<string, { refresh?: () => Promise<LiveSession[]> }>;
+  const adapters = (live as unknown as { integrations: Adapters }).integrations;
   for (const adapter of Object.values(adapters))
     if (typeof adapter?.refresh === 'function') adapter.refresh = async () => [];
   const sent: string[] = [];
@@ -41,7 +44,6 @@ test('OpenCode activity and controls come from the executing server when several
     harness: 'opencode',
     status,
     updatedAt: '2026-10-30T00:00:00.000Z',
-    messages: [],
     approvals: [],
     send: async () => {
       sent.push(owner);
@@ -54,6 +56,7 @@ test('OpenCode activity and controls come from the executing server when several
   try {
     let [current] = await live.refresh();
     assert.equal(current, other);
+    assert.deepEqual(await live.sessionsFor('opencode'), [other]);
     await current!.send!('running-reply', 'Continue');
     assert.deepEqual(sent, ['other-server']);
     other = session('other-server', 'attention');
@@ -67,6 +70,76 @@ test('OpenCode activity and controls come from the executing server when several
     [current] = await live.refresh();
     assert.equal(current, native);
     assert.equal(current!.status, 'idle');
+    assert.deepEqual(await live.sessionsFor('opencode'), [native]);
+  } finally {
+    live.stop();
+  }
+});
+
+test("a chat VS Code hosts for an agent stays among that agent's live sessions", async () => {
+  const live = new LiveHarnesses();
+  const adapters = (live as unknown as { integrations: Adapters }).integrations;
+  for (const adapter of Object.values(adapters))
+    if (typeof adapter?.refresh === 'function') adapter.refresh = async () => [];
+  const session = (id: string, harness: LiveSession['harness']): LiveSession => ({
+    id,
+    cwd: '/project',
+    harness,
+    status: 'idle',
+    updatedAt: '2026-11-17T00:00:00.000Z',
+    approvals: [],
+  });
+  adapters.codex!.refresh = async () => [session('codex-thread', 'codex')];
+  adapters.vscode!.refresh = async () => [
+    session('vscode-codex-chat', 'codex'),
+    session('vscode-claude-chat', 'claude'),
+    session('vscode-chat', 'other'),
+  ];
+  const ids = async (harness: LiveSession['harness']) =>
+    (await live.sessionsFor(harness)).map((item) => item.id);
+  try {
+    assert.deepEqual(await ids('codex'), ['codex-thread', 'vscode-codex-chat']);
+    assert.deepEqual(await ids('claude'), ['vscode-claude-chat']);
+    assert.deepEqual(await ids('other'), ['vscode-chat']);
+    assert.deepEqual(await ids('kimi'), []);
+  } finally {
+    live.stop();
+  }
+});
+
+test("each agent the phone starts is offered in one order and run by its host, OpenCode's by its service where that runs", async () => {
+  const live = new LiveHarnesses();
+  const hosts = (live as unknown as { integrations: Record<string, any> }).integrations;
+  const taken: unknown[][] = [];
+  const take = (...given: unknown[]) => void taken.push(given.filter(Boolean));
+  for (const [name, host] of Object.entries(hosts)) {
+    host.available = async () => name !== 'codex';
+    host.start = async (...given: unknown[]) => (take(name, 'start', ...given), name);
+    host.resume = async (...given: unknown[]) => take(name, 'resume', ...given);
+  }
+  hosts.codex.models = () => [{ value: 'model', name: 'Model' }];
+  hosts.kimi.recorded = (settings: object) => [{ id: 'plan', name: 'Plan', ...settings }];
+  const files = [{ path: '/project/shot.png', mime: 'image/png' }];
+  try {
+    assert.deepEqual(await live.agents(), ['claude', 'opencode', 'kimi', 'kilo', 'junie']);
+    assert.deepEqual(live.startModels('codex'), [{ value: 'model', name: 'Model' }]);
+    assert.deepEqual(live.startModels('kilo'), []);
+    assert.deepEqual(live.recorded('kimi', { value: true }), [
+      { id: 'plan', name: 'Plan', value: true },
+    ]);
+    assert.deepEqual(live.recorded('kilo', {}), []);
+    assert.deepEqual(live.recorded('cline', {}), []);
+    assert.equal(await live.start('claude', '/project', 'Begin', files, 'model'), 'headless');
+    assert.equal(await live.start('opencode', '/project', 'Begin'), 'service');
+    await live.resume('codex', 'thread', '/project', 'Continue', files);
+    hosts.service.available = async () => false;
+    await live.resume('opencode', 'session', '/project', 'Continue');
+    assert.deepEqual(taken, [
+      ['headless', 'start', '/project', 'Begin', files, 'model'],
+      ['service', 'start', '/project', 'Begin'],
+      ['codex', 'resume', 'thread', '/project', 'Continue', files],
+      ['opencode', 'resume', 'session', '/project', 'Continue'],
+    ]);
   } finally {
     live.stop();
   }
@@ -187,6 +260,16 @@ test('existing OpenCode endpoint reads, observes, sends and resolves native cont
         parts: body.parts,
       });
       response.writeHead(204).end();
+      // OpenCode begins its reply, or reports why it can't only as an event.
+      const properties = body.parts[0].text.includes('missing model')
+        ? {
+            sessionID: 'ses_original',
+            error: { name: 'UnknownError', data: { message: 'Model not found: gone/model.' } },
+          }
+        : { sessionID: 'ses_original', info: { id: 'msg_reply', role: 'assistant' } };
+      const type = 'error' in properties ? 'session.error' : 'message.updated';
+      for (const stream of streams)
+        stream.write(`data: ${JSON.stringify({ payload: { type, properties } })}\n\n`);
       return;
     } else if (pathname === '/session/ses_original/abort' && request.method === 'POST') {
       statuses = {};
@@ -243,7 +326,7 @@ test('existing OpenCode endpoint reads, observes, sends and resolves native cont
     );
     assert.equal(session?.id, 'ses_original');
     assert.equal(session?.cwd, '/original/project');
-    assert.deepEqual(session?.messages, []);
+    assert.equal(session?.readMessages, undefined);
     assert.equal(session?.status, 'attention');
     assert.deepEqual(
       session?.approvals[0]?.choices.map((choice) => choice.id),
@@ -252,7 +335,6 @@ test('existing OpenCode endpoint reads, observes, sends and resolves native cont
     assert.match(session!.approvals[0]!.detail, /Command:\npnpm test --filter native/);
     assert.match(session!.approvals[0]!.detail, /Permission scope:\npnpm \*/);
     assert.match(session!.approvals[0]!.detail, /Always allow scope:\npnpm \*/);
-    await session!.approve!('dashup-approval-1', 'perm_original', { choice: 'once' });
     await session!.approve!('dashup-approval-1', 'perm_original', { choice: 'once' });
     assert.equal(calls.filter((call) => call.path === '/permission/perm_original/reply').length, 1);
     await assert.rejects(
@@ -265,7 +347,6 @@ test('existing OpenCode endpoint reads, observes, sends and resolves native cont
     statuses = { ses_original: { type: 'busy' } };
     [session] = await live.refresh();
     assert.equal(session?.status, 'working');
-    await session!.stop!('dashup-stop');
     await session!.stop!('dashup-stop');
     assert.deepEqual(
       calls
@@ -285,7 +366,6 @@ test('existing OpenCode endpoint reads, observes, sends and resolves native cont
       parts: [{ type: 'text', text: 'Continue in the original Plan agent' }],
     });
     await session!.send!('dashup-reply-1', 'Continue the same work');
-    await session!.send!('dashup-reply-1', 'Continue the same work');
     const sent = calls.filter((call) => call.path.endsWith('/prompt_async'));
     assert.equal(sent.length, 1);
     assert.equal(sent[0]!.directory, '/original/project');
@@ -297,12 +377,16 @@ test('existing OpenCode endpoint reads, observes, sends and resolves native cont
     });
     assert.equal(sent[0]!.body.variant, 'high');
     assert.match(sent[0]!.body.messageID, /^msg_/);
+    await assert.rejects(
+      session!.send!('dashup-missing-model', 'Use the missing model'),
+      /Model not found: gone\/model\./,
+    );
     history.push({ info: { id: 'msg_invalid_context', role: 'user', agent: '' }, parts: [] });
     await assert.rejects(
       session!.send!('dashup-invalid-context', 'Must not switch agents'),
       /current agent or model/,
     );
-    assert.equal(calls.filter((call) => call.path.endsWith('/prompt_async')).length, 1);
+    assert.equal(calls.filter((call) => call.path.endsWith('/prompt_async')).length, 2);
     assert.equal(
       calls.filter((call) => call.method === 'POST' && call.path === '/session').length,
       0,
@@ -669,6 +753,67 @@ test('OpenCode 2 sessions are reached through its background service, with its p
   }
 });
 
+test(
+  'an OpenCode server this connector started is started again after it stops',
+  { skip: process.platform === 'win32' },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dashup-opencode-serve-'));
+    const started = join(root, 'started');
+    // Stands in for `opencode serve`: it names its port, starts sessions and takes prompts.
+    await writeFile(
+      join(root, 'opencode'),
+      `#!${process.execPath}
+const server = require('node:http').createServer((request, response) => {
+  const path = request.url.split('?')[0];
+  response.setHeader('Content-Type', 'application/json');
+  if (request.method === 'POST' && path === '/session')
+    response.end(JSON.stringify({ id: 'ses_' + process.pid }));
+  else if (request.method === 'POST' && path.endsWith('/prompt_async')) response.end('{}');
+  else if (path.endsWith('/message')) response.end('[]');
+  else response.writeHead(404).end('{}');
+});
+server.listen(0, '127.0.0.1', () => {
+  require('node:fs').appendFileSync(${JSON.stringify(started)}, process.pid + '\\n');
+  console.log('opencode server listening on http://127.0.0.1:' + server.address().port);
+});
+`,
+      { mode: 0o700 },
+    );
+    const restore = environment({
+      PATH: root,
+      DASHUP_LIVE_DISCOVERY: '0',
+      DASHUP_OPENCODE_ENDPOINT: undefined,
+      DASHUP_OPENCODE_ENDPOINTS: '[]',
+      OPENCODE_SERVER_PASSWORD: undefined,
+    });
+    const opencode = new OpenCode(() => {});
+    const servers = async () => (await readFile(started, 'utf8')).trim().split('\n').map(Number);
+    try {
+      const first = await opencode.start(root, 'First message');
+      assert.deepEqual(await servers(), [Number(first.slice('ses_'.length))]);
+      process.kill((await servers())[0]!);
+      let second = first;
+      const end = Date.now() + 3000;
+      while (second === first) {
+        try {
+          second = await opencode.start(root, 'Second message');
+        } catch (error) {
+          if (Date.now() > end) throw error;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+      }
+      assert.deepEqual(
+        await servers(),
+        [first, second].map((id) => Number(id.slice('ses_'.length))),
+      );
+    } finally {
+      opencode.stop();
+      restore();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
 test('local endpoint policy rejects remote hosts, URL credentials, path routing, query strings and redirects', async () => {
   for (const value of [
     'https://127.0.0.1:1234',
@@ -791,7 +936,10 @@ test(
     try {
       let [session] = await live.refresh();
       assert.equal(session?.id, 'original-codex-id');
-      assert.equal(session?.messages[0]?.text, 'Already running native conversation');
+      assert.equal(
+        (await session!.readMessages!()).messages[0]?.text,
+        'Already running native conversation',
+      );
       assert.equal(session?.status, 'idle');
       assert.ok(session?.send);
       assert.equal(session?.context, undefined);
@@ -827,7 +975,6 @@ test(
       await contextEvent('thread/closed');
       assert.equal(session?.context, undefined);
       await assert.rejects(session!.stop!('dashup-native-stop-idle'), /Nothing is running/);
-      await session!.send!('dashup-native-send', 'Same process, same conversation');
       await session!.send!('dashup-native-send', 'Same process, same conversation');
       const sent = calls.filter((call) => call.method === 'turn/start');
       assert.equal(sent.length, 1);
@@ -977,7 +1124,6 @@ test(
       assert.equal(session?.status, 'working');
       assert.equal(session?.send, undefined);
       await session!.stop!('dashup-native-stop');
-      await session!.stop!('dashup-native-stop');
       assert.deepEqual(
         calls.filter((call) => call.method === 'turn/interrupt').map((call) => call.params),
         [{ threadId: 'original-codex-id', turnId: 'native-turn' }],
@@ -1059,9 +1205,8 @@ test(
     try {
       let [session] = await codex.refresh();
       assert.equal(session?.status, 'working');
-      assert.deepEqual(session?.messages, []);
+      assert.deepEqual((await session!.readMessages!()).messages, []);
       assert.ok(session?.send);
-      await session.send('active-input', 'Continue with the failing tests');
       await session.send('active-input', 'Continue with the failing tests');
       assert.equal(calls.filter((call) => call.method === 'turn/start').length, 1);
       assert.equal(
@@ -1080,7 +1225,7 @@ test(
       await notify('item/agentMessage/delta', { itemId: 'draft', delta: 'Thinking through it' });
       [session] = await codex.refresh();
       assert.equal(session?.typing, 'Thinking through it');
-      assert.equal(session?.messages[0]?.id, 'earlier');
+      assert.equal((await session!.readMessages!()).messages[0]?.id, 'earlier');
       await notify('item/completed', { item: { id: 'draft', type: 'agentMessage' } });
       [session] = await codex.refresh();
       assert.equal(session?.typing, undefined);
@@ -1166,7 +1311,6 @@ test('a running Claude Code session takes replies, redirects and stops through t
     await session.send!('steer', 'Use the staging database');
     await session.send!('force', 'Stop and use staging', true);
     await session.stop!('stop');
-    await session.stop!('stop');
     await waitFor(() => first.lines.length === 3);
     assert.deepEqual(first.lines, [
       { text: 'Use the staging database' },
@@ -1188,6 +1332,36 @@ test('a running Claude Code session takes replies, redirects and stops through t
     claude.stop();
     if (home === undefined) delete process.env.CLAUDE_CONFIG_DIR;
     else process.env.CLAUDE_CONFIG_DIR = home;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('Claude Code’s plugin and Pi meet a connector in the person’s Dashup folder, whatever state file it runs with', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dashup-meeting-'));
+  const folder = join(root, 'home', '.dashup');
+  const restore = environment({
+    HOME                  : join(root, 'home'),
+    DASHUP_CONFIG         : join(root, 'elsewhere', 'connector.json'),
+    DASHUP_PI_DIRECTORY   : undefined,
+    DASHUP_LIVE_DISCOVERY : undefined,
+  });
+  const first = new Claude(() => {});
+  const second = new Claude(() => {});
+  try {
+    await first.listen();
+    assert.ok((await lstat(join(folder, 'claude.sock'))).isSocket());
+    assert.equal(piDirectory(), join(folder, 'pi'));
+    // Another connector leaves the socket to the one that answers there.
+    await assert.rejects(second.listen(), /another Dashup connector/);
+    const asked = request({ socketPath: join(folder, 'claude.sock'), path: '/sessions/session' });
+    asked.end();
+    const [response] = (await once(asked, 'response')) as [IncomingMessage];
+    assert.equal(response.statusCode, 200);
+    asked.destroy();
+  } finally {
+    first.stop();
+    second.stop();
+    restore();
     await rm(root, { recursive: true, force: true });
   }
 });

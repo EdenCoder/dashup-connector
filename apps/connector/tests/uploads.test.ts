@@ -1,14 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
-import { randomBytes } from 'node:crypto';
-import { mkdtemp, readFile, writeFile, rm, stat, symlink, mkdir } from 'node:fs/promises';
+import { createHash, randomBytes } from 'node:crypto';
+import { join, dirname, relative } from 'node:path';
+import { rm, stat, mkdir, lstat, mkdtemp, symlink, utimes, lutimes, readFile, writeFile } from 'node:fs/promises';
 
 import { MAX_ATTACHMENT_BYTES, type Attachment, type PairingRecord } from '@dashup/protocol';
 import { newSecret, sealAttachment } from '@dashup/protocol/crypto';
 
-import { receiveUploads } from '../src/uploads';
+import { Connector } from '../src/connector';
+import { forgetUploads, expireUploads, receiveUploads } from '../src/uploads';
 import type { ConnectorConfig } from '../src/config';
 
 async function fixture(
@@ -131,5 +132,90 @@ test('existing file and directory symlinks cannot redirect uploaded content', as
     await mkdir(other);
     await symlink(other, join(root, 'uploads'));
     await assert.rejects(receiveUploads(config, pair, 'inspect', [item]), /not a directory/);
+  });
+});
+
+// =============================================================================
+// Removing uploads
+// =============================================================================
+
+const DAY = 24 * 60 * 60_000;
+const exists = async (path: string) => !!(await lstat(path).catch(() => undefined));
+
+test('a revoked pairing takes its uploads with it, and a pairing still held keeps its own', async () => {
+  await fixture(async ({ config, pair, item, sealed }) => {
+    const held = { ...pair, id: 'held' };
+    const key = newSecret(randomBytes);
+    config.pairs[held.id] = { key, sequence: 0 };
+    config.device = {
+      id       : pair.device,
+      user     : 'user',
+      kind     : 'desktop',
+      name     : 'Computer',
+      platform : 'linux',
+    };
+    const revoked = (await receiveUploads(config, pair, 'inspect', [item])).files[0]!.path;
+    const own = sealAttachment(key, held.id, item.id, Buffer.from('kept'), randomBytes);
+    globalThis.fetch = async () => new Response(new Uint8Array(own));
+    const [kept] = (await receiveUploads(config, held, 'inspect', [{ ...item, bytes: 4 }])).files;
+    globalThis.fetch = async () => new Response(new Uint8Array(sealed));
+    const connector = new Connector(config);
+    try {
+      connector['acceptPairings']([{ ...pair, revokedAt: '2026-11-18T00:00:00.000Z' }, held]);
+      for (let wait = 0; wait < 100 && (await exists(dirname(dirname(revoked)))); wait++)
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(await exists(dirname(dirname(revoked))), false);
+      assert.equal(await readFile(kept!.path, 'utf8'), 'kept');
+    } finally {
+      connector.stop();
+    }
+  });
+});
+
+test('an upload goes a day after the phone last sent it', async () => {
+  await fixture(async ({ config, pair, item }) => {
+    const path = (await receiveUploads(config, pair, 'inspect', [item])).files[0]!.path;
+    const stale = new Date(Date.now() - DAY - 60_000);
+    await utimes(dirname(path), stale, stale);
+    // Sent again, the same upload stays another day.
+    await receiveUploads(config, pair, 'inspect', [item]);
+    await expireUploads();
+    assert.equal(await exists(path), true);
+    await utimes(dirname(path), stale, stale);
+    await expireUploads();
+    assert.equal(await exists(dirname(path)), false);
+    assert.equal(await exists(dirname(dirname(path))), true);
+  });
+});
+
+test('removing uploads never follows a link out of the uploads folder', async () => {
+  await fixture(async ({ root, config, pair, item }) => {
+    const path = (await receiveUploads(config, pair, 'inspect', [item])).files[0]!.path;
+    const upload = dirname(path);
+    const outside = join(root, 'outside');
+    await mkdir(join(outside, 'f'.repeat(64)), { recursive: true });
+    await writeFile(join(outside, 'kept.txt'), 'untouched');
+    const stale = new Date(Date.now() - DAY - 60_000);
+    // A link inside an expired upload goes with it; what it names stays.
+    await symlink(join(outside, 'kept.txt'), join(upload, 'link'));
+    // A link where an upload or a pairing's folder would be is never followed.
+    await symlink(outside, join(dirname(upload), 'e'.repeat(64)));
+    await lutimes(join(dirname(upload), 'e'.repeat(64)), stale, stale);
+    await symlink(outside, join(root, 'uploads', 'd'.repeat(64)));
+    await utimes(join(outside, 'f'.repeat(64)), stale, stale);
+    await utimes(upload, stale, stale);
+    await expireUploads();
+    assert.equal(await exists(upload), false);
+    assert.equal(await readFile(join(outside, 'kept.txt'), 'utf8'), 'untouched');
+    assert.equal(await exists(join(outside, 'f'.repeat(64))), true);
+    // Nor when the uploads folder itself is a link.
+    const moved = join(root, 'moved', createHash('sha256').update(pair.id).digest('hex'), item.id);
+    await mkdir(moved, { recursive: true });
+    await utimes(moved, stale, stale);
+    await rm(join(root, 'uploads'), { recursive: true });
+    await symlink(join(root, 'moved'), join(root, 'uploads'));
+    await expireUploads();
+    await forgetUploads(pair.id);
+    assert.equal(await exists(moved), true);
   });
 });
